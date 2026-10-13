@@ -590,6 +590,58 @@ def test_a_throttled_later_source_keeps_the_ticker_artifact_and_the_book(
         assert "classification:BTCUSDT" in second["retries"]
 
 
+def test_ticker_pages_survive_a_budget_stop_and_the_next_capture_resumes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    requested: list[int] = []
+
+    def reader(url: str, params: dict[str, str] | None) -> object:
+        del params
+        if url.endswith("/global"):
+            return {"data": {"market_cap_percentage": {"btc": "54.2"}, "updated_at": 1_759_000_000}}
+        if "stablecoincharts" in url:
+            return [{"date": 1_759_000_000, "totalCirculatingUSD": {"peggedUSD": "10"}}]
+        if "tickers?page=" in url:
+            page = int(url.rsplit("=", 1)[-1])
+            requested.append(page)
+            if page >= 6:
+                raise RateLimited("60")
+            return _full_ticker_page()
+        catalog = _catalog(url)
+        if catalog is not None:
+            return catalog
+        raise AssertionError(url)
+
+    with mock_aws():
+        client = _bucket(monkeypatch)
+        source = EvidenceSource(
+            _Spot(), NOW, Decimal("0.02"), BASE, reader, remaining=lambda: 20_000
+        )
+        first = session_capture.capture(
+            {}, _Context(), now=NOW, source=source, client=client, root=tmp_path
+        )
+        prefix = "captures/session=2026-10-07/classification_sources/tickers/"
+        assert requested == [1, 2, 3, 4, 5, 6]
+        assert [f"{prefix}page={page}.json" for page in range(1, 6)] == [
+            key for key in first["written"] if key.startswith(prefix)
+        ]
+        assert (
+            "captures/session=2026-10-07/classification_sources/tickers.json"
+            not in (first["written"])
+        )
+        assert not any("/classification/symbol=" in key for key in first["written"])
+        assert "captures/session=2026-10-07/book/symbol=BTCUSDT.json" in first["written"]
+        assert source.catalog_trace[-1]["outcome"] == "abandoned"
+        requested.clear()
+        resumed = EvidenceSource(
+            _Spot(), NOW, Decimal("0.02"), BASE, reader, remaining=lambda: 20_000
+        )
+        session_capture.capture(
+            {}, _Context(), now=NOW, source=resumed, client=client, root=tmp_path
+        )
+        assert requested == [6]
+
+
 def test_a_coingecko_429_is_retried_before_the_catalog_is_abandoned() -> None:
     calls = {"n": 0}
 

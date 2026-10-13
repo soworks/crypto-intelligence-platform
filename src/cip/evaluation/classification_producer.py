@@ -30,10 +30,14 @@ _EUR = (
 _MARKETS = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&per_page=250&ids="
 _MARKETING = "https://www.binance.com/bapi/composite/v1/public/marketing/symbol/list"
 _Reader = Callable[[str], object]
+_PAGE_SPEC = {
+    "tickers": (_TICKERS, "tickers", 100),
+    "eur": (_EUR, None, 250),
+}
 
 
 class CatalogIncomplete(Exception):
-    """A catalog ended before its last page. Nothing from it is stored."""
+    """A page ended before it could be stored. Earlier pages of this session stay."""
 
 
 def produce_classifications(
@@ -79,21 +83,30 @@ def _pages(get: _Reader, url: str, key: str | None, page_size: int) -> list[obje
     raise CatalogIncomplete("classification catalog is incomplete")
 
 
+def fetch_page(name: str, get: _Reader, page: int) -> tuple[list[object], int]:
+    """One catalog page. A body that is not a list is not a page."""
+    spec = _PAGE_SPEC.get(name)
+    if spec is None or page < 1:
+        raise EvaluationError("classification source is unknown")
+    template, key, size = spec
+    payload = get(template.format(page=page))
+    batch = payload.get(key) if key is not None and isinstance(payload, dict) else payload
+    if not isinstance(batch, list) or len(batch) > size:
+        raise CatalogIncomplete("classification catalog is incomplete")
+    return batch, size
+
+
 def fetch_component(
     name: str,
     get: _Reader,
     pairs: Sequence[tuple[str, str]],
     prior: dict[str, object],
 ) -> object:
-    """One complete source. A short page is stored only with the finished catalog."""
-    if name == "tickers":
-        return _pages(get, _TICKERS, "tickers", 100)
+    """One finished non-paginated source. Ticker and euro pages are stored individually."""
     if name == "assets":
         return get(_ASSET)
     if name == "coins":
         return get(_COINS)
-    if name == "eur":
-        return _pages(get, _EUR, None, 250)
     if name == "marketing":
         payload = get(_MARKETING)
         rows = payload.get("data") if isinstance(payload, dict) else None
