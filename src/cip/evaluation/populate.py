@@ -194,10 +194,11 @@ def populate_session(
     if not git_sha:
         raise EvaluationError("git sha is missing")
     plan = _plan(session, close, captures)
-    readiness = _assess(session, as_of, plan, weights_present)
+    _attach_stage(root, session, plan)
+    readiness = _assess(root, session, as_of, plan, weights_present)
     path = root / _manifest_path(session)
     if path.is_file():
-        return _kept(session, plan, path, as_of, git_sha, weights_present)
+        return _kept(root, session, plan, path, as_of, git_sha, weights_present)
     if "session_not_closed" in readiness.blocks or _corrupt(readiness.blocks):
         return PopulationResult(readiness, None)
     _write(root, session, plan)
@@ -243,7 +244,12 @@ def _plan(session: date, close: datetime, captures: SessionCaptures) -> _Plan:
     )
 
 
-def _assess(session: date, as_of: datetime, plan: _Plan, weights_present: bool) -> SessionReadiness:
+def _assess(
+    root: Path, session: date, as_of: datetime, plan: _Plan, weights_present: bool
+) -> SessionReadiness:
+    from cip.evaluation.stage import settlements
+
+    symbols = () if plan.snapshot is None else plan.snapshot.symbols
     return assess_session(
         session,
         as_of,
@@ -256,12 +262,15 @@ def _assess(session: date, as_of: datetime, plan: _Plan, weights_present: bool) 
         regime_failures=plan.failures,
         weights_present=weights_present,
         bar_absences=plan.bar_absences,
+        settled=settlements(root, session, symbols),
     )
 
 
 def _assess_stored(
     root: Path, session: date, as_of: datetime, weights_present: bool
 ) -> SessionReadiness:
+    from cip.evaluation.stage import settlements
+
     recorded = load_session(root, session)
     bars = _load_bars(root, session)
     observations, failures = _load_regime(root, session)
@@ -277,10 +286,16 @@ def _assess_stored(
         regime_failures=failures,
         weights_present=weights_present,
         bar_absences=recorded.bar_absences,
+        settled=settlements(
+            root,
+            session,
+            () if recorded.snapshot is None else recorded.snapshot.symbols,
+        ),
     )
 
 
 def _kept(
+    root: Path,
     session: date,
     plan: _Plan,
     path: Path,
@@ -290,10 +305,13 @@ def _kept(
 ) -> PopulationResult:
     """Return the first freeze, or refuse before any new file is created."""
     existing = _read_manifest(path)
+    _attach_stage(root, session, plan)
     built = _planned_manifest(session, as_of, git_sha, weights_present, plan)
     if not _same_freeze(existing, built):
         raise EvaluationError("finalized session already exists with a different payload")
-    readiness = _assess(session, existing.finalized_at, plan, existing.score_weights == "present")
+    readiness = _assess(
+        root, session, existing.finalized_at, plan, existing.score_weights == "present"
+    )
     return PopulationResult(readiness, existing)
 
 
@@ -789,6 +807,8 @@ def _planned_hashes(plan: _Plan) -> tuple[str, str, str, str]:
         filename = Path(name).name
         if "bars" in Path(name).parts:
             bars.append((f"bars/{filename}", body))
+        elif "classification" in Path(name).parts or "lane" in Path(name).parts:
+            candidates.append((f"{Path(name).parent.name}/{filename}", body))
         else:
             regime.append((f"regime/{filename}", body))
     for absence in plan.absences:
@@ -809,6 +829,8 @@ def _hashes(root: Path, session: date) -> tuple[str, str, str, str]:
     bars.extend(_named(root / _absence_dir(session, "daily_bar"), "bar-absence"))
     candidates = _named(root / _candidate_dir(session), "candidates")
     candidates.extend(_named(root / _absence_dir(session, "candidate"), "candidate-absence"))
+    candidates.extend(_named(root / _stage_dir(session, "classification"), "classification"))
+    candidates.extend(_named(root / _stage_dir(session, "lane"), "lane"))
     regime = _named(root / _regime_path(session, "btc_dominance").parent, "regime")
     return (_sha(universe.read_bytes()), _bundle(bars), _bundle(candidates), _bundle(regime))
 
@@ -936,6 +958,18 @@ def _bar_path(session: date, symbol: str) -> Path:
 
 def _candidate_dir(session: date) -> Path:
     return _session_dir(session) / "candidates"
+
+
+def _stage_dir(session: date, label: str) -> Path:
+    return _session_dir(session) / label
+
+
+def _attach_stage(root: Path, session: date, plan: _Plan) -> None:
+    """Freeze the classification and lane files that explain a terminal stage."""
+    for label in ("classification", "lane"):
+        source = root / "captures" / f"session={session.isoformat()}" / label
+        for path in _files(source):
+            plan.documents[(_stage_dir(session, label) / path.name).as_posix()] = path.read_bytes()
 
 
 def _absence_dir(session: date, kind: str) -> Path:

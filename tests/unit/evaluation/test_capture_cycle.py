@@ -460,28 +460,132 @@ def test_post_close_stores_a_derived_count_when_the_hours_reconcile(tmp_path: Pa
     assert retry.calls == []
 
 
-def test_finalization_waits_until_the_stage_files_exist(tmp_path: Path) -> None:
+def test_an_evidence_block_finalizes_without_downstream_bars(tmp_path: Path) -> None:
     early = run_capture_cycle(tmp_path, NOW, Source(_pre_answers(OPEN, NOW)), ("BTCUSDT",))
     assert early.readiness is None
     assert not (tmp_path / "sessions").exists()
-    answers: Answers = {
-        (OPEN, "daily_bars", "BTCUSDT"): _days(OPEN, Decimal("4800")),
-        (OPEN, "hour_bars", "BTCUSDT"): _hours(OPEN, (Decimal("4800"),) + (Decimal("0"),) * 23),
-    }
-    waiting = run_capture_cycle(tmp_path, AFTER, Source(answers), ("BTCUSDT",), requested=OPEN)
-    assert waiting.readiness is None
-    assert waiting.finalized is False
-    store_packet(tmp_path, OPEN, _packet(OPEN, NOW))
-    ready = run_capture_cycle(tmp_path, AFTER, Source({}), ("BTCUSDT",), requested=OPEN)
+    ready = run_capture_cycle(
+        tmp_path,
+        AFTER,
+        Source({}, fail={(OPEN, "daily_bars", "BTCUSDT"), (OPEN, "hour_bars", "BTCUSDT")}),
+        ("BTCUSDT",),
+        requested=OPEN,
+    )
     assert ready.readiness is not None
     assert ready.readiness.ready is True
     assert ready.finalized is True
+    notes = ready.readiness.decision_notes
+    assert any(note.startswith("evidence_blocked:BTCUSDT:missing_") for note in notes)
+    assert not any(note.startswith("policy_rejected:BTCUSDT:") for note in notes)
+    universe = json.loads((tmp_path / "sessions/date=2026-10-07/universe.json").read_text())
+    assert universe["symbols"] == ["BTCUSDT"]
+    assert not (tmp_path / "captures/session=2026-10-07/final/symbol=BTCUSDT.json").exists()
     manifest = tmp_path / "sessions/date=2026-10-07/manifest.json"
     body = manifest.read_bytes()
     held = run_capture_cycle(tmp_path, AFTER, Source({}), ("BTCUSDT",), requested=OPEN)
     assert held.calls == ()
     assert held.finalized is True
     assert manifest.read_bytes() == body
+    from cip.evaluation.populate import populate_session
+    from cip.evaluation.prospect import load_closed
+
+    again = populate_session(
+        tmp_path,
+        OPEN,
+        AFTER,
+        load_closed(tmp_path, OPEN),
+        git_sha="0" * 40,
+        weights_present=False,
+    )
+    assert again.manifest is not None
+    assert again.readiness.ready is True
+
+
+def test_a_missing_classification_or_lane_file_is_not_ready(tmp_path: Path) -> None:
+    from cip.evaluation.capture_cycle import _symbol_ready
+    from cip.evaluation.stage import load_universe
+
+    policy = load_universe()
+    assert _symbol_ready(tmp_path, OPEN, "BTCUSDT", policy) is False
+    _closed_passer(tmp_path)
+    lane = tmp_path / "captures/session=2026-10-07/lane/symbol=BTCUSDT.json"
+    lane.unlink()
+    assert _symbol_ready(tmp_path, OPEN, "BTCUSDT", policy) is False
+
+
+def test_a_lane_passer_still_waits_for_downstream_evidence(tmp_path: Path) -> None:
+    _closed_passer(tmp_path)
+    waiting = run_capture_cycle(
+        tmp_path,
+        AFTER,
+        Source({}, fail={(OPEN, "daily_bars", "BTCUSDT"), (OPEN, "hour_bars", "BTCUSDT")}),
+        ("BTCUSDT",),
+        requested=OPEN,
+    )
+    assert waiting.finalized is False
+    answers: Answers = {
+        (OPEN, "daily_bars", "BTCUSDT"): _days(OPEN, Decimal("4800")),
+        (OPEN, "hour_bars", "BTCUSDT"): _hours(OPEN, (Decimal("4800"),) + (Decimal("0"),) * 23),
+    }
+    run_capture_cycle(tmp_path, AFTER, Source(answers), ("BTCUSDT",), requested=OPEN)
+    store_packet(tmp_path, OPEN, _packet(OPEN, NOW))
+    store_session_book(tmp_path, OPEN, "BTCUSDT", BookShot(Decimal("5"), NOW, NOW))
+    ready = run_capture_cycle(tmp_path, AFTER, Source({}), ("BTCUSDT",), requested=OPEN)
+    assert ready.finalized is True
+    assert ready.readiness is not None
+    assert ready.readiness.ready is True
+
+
+def _closed_passer(root: Path) -> None:
+    from cip.evaluation.classification import store_classification
+    from cip.evaluation.eligibility import Lane
+    from cip.evaluation.lane_fields import LaneFields, store_lane
+
+    run_capture_cycle(root, NOW, Source(_pre_answers(OPEN, NOW)), ("BTCUSDT",))
+    folder = root / "captures/session=2026-10-07/classification"
+    for path in folder.glob("symbol=*.json"):
+        path.unlink()
+    item = SymbolClassification(
+        symbol="BTCUSDT",
+        base_asset="BTC",
+        eur_stable=False,
+        fan_token=False,
+        monitoring_tag=False,
+        delisting=False,
+        deposits_suspended=False,
+        withdrawals_suspended=False,
+        pending_migration=False,
+        coin_id="bitcoin",
+        mapping="unambiguous",
+        market_cap_usd=Decimal("1000000000"),
+        market_cap_source_timestamp=NOW,
+        cmc_id=None,
+        cmc_market_cap_usd=None,
+        cmc_source_timestamp=None,
+    )
+    store_classification(root, OPEN, item, NOW)
+    store_lane(
+        root,
+        OPEN,
+        LaneFields(
+            symbol="BTCUSDT",
+            base_asset="BTC",
+            lane=Lane.NORMAL,
+            coin_id="bitcoin",
+            circulating_ratio=Decimal("0.8"),
+            history_days=(OPEN - date(2017, 8, 17)).days,
+            history_open=datetime(2017, 8, 17, tzinfo=UTC),
+            market_cap_rank=1,
+            fdv_to_market_cap=Decimal("1.2"),
+            unlock_state="unavailable",
+            market_source_timestamp=NOW,
+            market_captured_at=NOW,
+            history_captured_at=NOW,
+            unlock_provider=None,
+            unlock_provider_id=None,
+            unlock_source_timestamp=None,
+        ),
+    )
 
 
 def test_a_finalized_session_is_not_captured_again(tmp_path: Path) -> None:
