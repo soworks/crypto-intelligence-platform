@@ -510,11 +510,39 @@ def _post_close(
     if session is None:
         return
     ordered: list[str] = []
-    for symbol in (*symbols, "BTCUSDT"):
+    for symbol in (*symbols, "BTCUSDT", *_completed_passers(root, session)):
         if symbol not in ordered:
             ordered.append(symbol)
     for symbol in ordered:
         _one_bar(root, cycle, source, symbol, calls, skipped, retries, spikes)
+
+
+def _completed_passers(root: Path, session: date) -> tuple[str, ...]:
+    """Normal-lane passers. Their completed bars are fetched only after the close."""
+    try:
+        symbols = _captured_symbols(root, session)
+    except (EvaluationError, json.JSONDecodeError):
+        return ()
+    universe = load_universe()
+    found: list[str] = []
+    for symbol in symbols:
+        try:
+            loaded = load_symbol(root, session, symbol)
+        except EvaluationError:
+            continue
+        if loaded is None:
+            continue
+        item, lane = loaded
+        if lane is None or lane.lane is not Lane.NORMAL:
+            continue
+        try:
+            settled = settle(item, lane, universe)
+        except EvaluationError:
+            continue
+        if settled is not None:
+            continue
+        found.append(symbol)
+    return tuple(found)
 
 
 def _one_bar(
