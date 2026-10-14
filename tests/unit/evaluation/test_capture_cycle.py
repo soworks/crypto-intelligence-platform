@@ -594,6 +594,287 @@ def _closed_passer(root: Path) -> None:
     )
 
 
+def test_a_normal_passer_stores_one_current_book(tmp_path: Path) -> None:
+    from cip.adapters.market import Depth, DepthLevel
+    from cip.evaluation.capture_cycle import _acquire_liquidity
+    from cip.evaluation.eligibility import Lane
+    from cip.evaluation.liquidity_capture import book_metrics
+    from cip.evaluation.prospect import store_universe
+
+    store_universe(tmp_path, OPEN, universe_capture(OPEN, _info(), NOW, NOW))
+    universe = tmp_path / "captures/session=2026-10-07/universe.json"
+    document = json.loads(universe.read_text())
+    document["symbols"] = ["PASSUSDT", "HIGHUSDT", "SHORTUSDT", "NOLANEUSDT", "GONEUSDT"]
+    universe.write_text(json.dumps(document))
+    _passer(tmp_path, "PASSUSDT", "PASS", Decimal("1000000000"), Lane.NORMAL, days=400)
+    _passer(tmp_path, "HIGHUSDT", "HIGH", Decimal("100000000"), Lane.HIGH_RISK, days=200)
+    _passer(tmp_path, "SHORTUSDT", "SHORT", Decimal("1000000000"), Lane.NORMAL, days=1)
+    _passer(tmp_path, "NOLANEUSDT", "NOLANE", Decimal("1000000000"), None, days=400)
+    bids = (DepthLevel(Decimal("100"), Decimal("1000")),)
+    asks = (DepthLevel(Decimal("100.1"), Decimal("1000")),)
+    reading = book_metrics(Depth(0, bids, asks), band=Decimal("0.02"), observed_at=NOW)
+    assert reading is not None
+    shot = BookShot(
+        reading.spread_bps,
+        NOW,
+        NOW,
+        ((Decimal("100"), Decimal("1000")),),
+        ((Decimal("100.1"), Decimal("1000")),),
+    )
+    ticker = {
+        "captured_at": "2026-10-07T19:00:00Z",
+        "rows": [{"symbol": "PASSUSDT", "quote_volume": "5000000"}],
+        "session": "2026-10-07",
+    }
+    (tmp_path / "captures/session=2026-10-07/ticker.json").write_text(json.dumps(ticker))
+    peg = {
+        "captured_at": "2026-10-07T19:00:00Z",
+        "closes": ["1"],
+        "session": "2026-10-07",
+        "symbol": "USDCUSDT",
+    }
+    peg_path = tmp_path / "captures/session=2026-10-07/peg/symbol=USDCUSDT.json"
+    peg_path.parent.mkdir(parents=True)
+    peg_path.write_text(json.dumps(peg))
+    markets = {
+        "payload": [
+            {
+                "id": "pass",
+                "last_updated": "2026-10-07T19:00:00Z",
+                "total_volume": 20000000,
+            }
+        ]
+    }
+    source_path = tmp_path / "captures/session=2026-10-07/classification_sources/markets.json"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(json.dumps(markets))
+    calls: list[tuple[str, str | None]] = []
+    retries: list[str] = []
+    failed = Source({}, fail={(OPEN, "book", "PASSUSDT")})
+    _acquire_liquidity(tmp_path, OPEN, NOW, failed, calls, retries)
+    assert retries == ["book:PASSUSDT"]
+    assert calls == []
+    calls.clear()
+    retries.clear()
+    source = Source({(OPEN, "book", "PASSUSDT"): shot})
+    _acquire_liquidity(tmp_path, OPEN, NOW, source, calls, retries)
+    assert calls == [("book", "PASSUSDT")]
+    assert retries == []
+    stored = json.loads(
+        (tmp_path / "captures/session=2026-10-07/liquidity/symbol=PASSUSDT.json").read_text()
+    )
+    assert stored["spread_snapshots"] == 1
+    assert stored["taker_buy_ratio"] is None
+    assert stored["spike_candle_count"] is None
+    assert stored["median_quote_volume_30d_usd"] is None
+    assert stored["turnover"] is not None
+    assert stored["binance_volume_share"] is not None
+    assert stored["stablecoin_peg_deviation"] == "0"
+    assert not (tmp_path / "captures/session=2026-10-07/book/symbol=HIGHUSDT.json").exists()
+    calls.clear()
+    _acquire_liquidity(tmp_path, OPEN, NOW, Source({}), calls, retries)
+    assert calls == []
+
+
+def test_a_book_that_is_not_a_shot_is_refused(tmp_path: Path) -> None:
+    from cip.evaluation.capture_cycle import (
+        _acquire_liquidity,
+        _aggregate_volume,
+        _clock_of,
+        _levels,
+        _money,
+        _peg_closes,
+        _store_passer_liquidity,
+        _ticker_quote,
+    )
+    from cip.evaluation.classification import SymbolClassification
+    from cip.evaluation.eligibility import Lane
+    from cip.evaluation.prospect import store_universe
+
+    store_universe(tmp_path, OPEN, universe_capture(OPEN, _info(), NOW, NOW))
+    universe = tmp_path / "captures/session=2026-10-07/universe.json"
+    document = json.loads(universe.read_text())
+    document["symbols"] = ["PASSUSDT"]
+    universe.write_text(json.dumps(document))
+    _passer(tmp_path, "PASSUSDT", "PASS", Decimal("1000000000"), Lane.NORMAL, days=400)
+    item = SymbolClassification(
+        symbol="PASSUSDT",
+        base_asset="PASS",
+        eur_stable=False,
+        fan_token=False,
+        monitoring_tag=False,
+        delisting=False,
+        deposits_suspended=False,
+        withdrawals_suspended=False,
+        pending_migration=False,
+        coin_id=None,
+        mapping="unambiguous",
+        market_cap_usd=Decimal("1000000000"),
+        market_cap_source_timestamp=None,
+        cmc_id=None,
+        cmc_market_cap_usd=None,
+        cmc_source_timestamp=None,
+    )
+    calls: list[tuple[str, str | None]] = []
+    with pytest.raises(EvaluationError, match="unusable"):
+        _acquire_liquidity(
+            tmp_path, OPEN, NOW, Source({(OPEN, "book", "PASSUSDT"): "nope"}), calls, []
+        )
+    book = tmp_path / "captures/session=2026-10-07/book/symbol=PASSUSDT.json"
+    book.parent.mkdir(parents=True, exist_ok=True)
+    book.write_text("[]")
+    with pytest.raises(EvaluationError, match="unusable"):
+        _store_passer_liquidity(
+            tmp_path, OPEN, NOW, "PASSUSDT", item, Decimal("0.02"), Decimal("0.005")
+        )
+    book.write_text(json.dumps({"captured_at": "2026-10-07T19:00:00Z", "bids": "no", "asks": []}))
+    with pytest.raises(EvaluationError, match="unusable"):
+        _store_passer_liquidity(
+            tmp_path, OPEN, NOW, "PASSUSDT", item, Decimal("0.02"), Decimal("0.005")
+        )
+    refused = (
+        lambda: _levels([["1"]]),
+        lambda: _money(True),
+        lambda: _money("nope"),
+        lambda: _money(-1),
+        lambda: _money(float("nan")),
+        lambda: _clock_of(None, "captured_at"),
+    )
+    for call in refused:
+        with pytest.raises(EvaluationError, match="unusable"):
+            call()
+    assert _money(1.25) == Decimal("1.25")
+    assert _ticker_quote(tmp_path, OPEN, "PASSUSDT") == (None, None)
+    assert _peg_closes(tmp_path, OPEN) == ((), None)
+    assert _aggregate_volume(tmp_path, OPEN, None, NOW) is None
+    ticker = tmp_path / "captures/session=2026-10-07/ticker.json"
+    ticker.write_text("[]")
+    assert _ticker_quote(tmp_path, OPEN, "PASSUSDT") == (None, None)
+    ticker.write_text(json.dumps({"captured_at": "2026-10-07T19:00:00Z", "rows": "no"}))
+    assert _ticker_quote(tmp_path, OPEN, "PASSUSDT") == (None, None)
+    ticker.write_text(
+        json.dumps(
+            {
+                "captured_at": "2026-10-07T19:00:00Z",
+                "rows": ["PASSUSDT", {"symbol": "OTHER", "quote_volume": "1"}],
+            }
+        )
+    )
+    assert _ticker_quote(tmp_path, OPEN, "PASSUSDT") == (None, None)
+    peg = tmp_path / "captures/session=2026-10-07/peg/symbol=USDCUSDT.json"
+    peg.parent.mkdir(parents=True)
+    peg.write_text("[]")
+    assert _peg_closes(tmp_path, OPEN) == ((), None)
+    peg.write_text(json.dumps({"captured_at": "2026-10-07T19:00:00Z", "closes": "1"}))
+    assert _peg_closes(tmp_path, OPEN) == ((), None)
+    assert _aggregate_volume(tmp_path, OPEN, "pass", NOW) is None
+    markets = tmp_path / "captures/session=2026-10-07/classification_sources/markets.json"
+    markets.parent.mkdir(parents=True)
+    markets.write_text("[]")
+    assert _aggregate_volume(tmp_path, OPEN, "pass", NOW) is None
+    markets.write_text(json.dumps({"payload": {"id": "pass"}}))
+    assert _aggregate_volume(tmp_path, OPEN, "pass", NOW) is None
+    markets.write_text(
+        json.dumps(
+            {
+                "payload": [
+                    "pass",
+                    {"id": "other", "last_updated": "2026-10-07T19:00:00Z", "total_volume": 1},
+                    {"id": "pass", "last_updated": "2026-10-07T18:00:00Z", "total_volume": 1},
+                ]
+            }
+        )
+    )
+    assert _aggregate_volume(tmp_path, OPEN, "pass", NOW) is None
+    markets.write_text(json.dumps({"payload": [{"id": "other"}]}))
+    assert _aggregate_volume(tmp_path, OPEN, "pass", NOW) is None
+    from cip.evaluation.liquidity_capture import build_liquidity
+
+    empty = build_liquidity(
+        "PASSUSDT",
+        session=OPEN,
+        captured_at=NOW,
+        spread_bps=Decimal("1"),
+        bid_usd=Decimal("1"),
+        ask_usd=Decimal("2"),
+        book_observed_at=NOW,
+    )
+    assert empty.hourly_closes == ()
+    bare = build_liquidity(
+        "PASSUSDT",
+        session=OPEN,
+        captured_at=NOW,
+        spread_bps=Decimal("1"),
+        bid_usd=Decimal("1"),
+        ask_usd=Decimal("2"),
+        book_observed_at=NOW,
+        hourly_closes=(Decimal("1"),),
+        peg_limit=None,
+    )
+    assert bare.stablecoin_peg_deviation is None
+    assert bare.median_quote_volume_30d_usd is None
+
+
+def _passer(
+    root: Path,
+    symbol: str,
+    base: str,
+    cap: Decimal,
+    lane: object,
+    *,
+    days: int,
+) -> None:
+    from cip.evaluation.classification import store_classification
+    from cip.evaluation.eligibility import Lane
+    from cip.evaluation.lane_fields import LaneFields, store_lane
+
+    item = SymbolClassification(
+        symbol=symbol,
+        base_asset=base,
+        eur_stable=False,
+        fan_token=False,
+        monitoring_tag=False,
+        delisting=False,
+        deposits_suspended=False,
+        withdrawals_suspended=False,
+        pending_migration=False,
+        coin_id=base.lower(),
+        mapping="unambiguous",
+        market_cap_usd=cap,
+        market_cap_source_timestamp=NOW,
+        cmc_id=None,
+        cmc_market_cap_usd=None,
+        cmc_source_timestamp=None,
+    )
+    store_classification(root, OPEN, item, NOW)
+    if lane is None:
+        return
+    chosen = Lane.NORMAL if lane is Lane.NORMAL else Lane.HIGH_RISK
+    opened = OPEN - timedelta(days=days)
+    store_lane(
+        root,
+        OPEN,
+        LaneFields(
+            symbol=symbol,
+            base_asset=base,
+            lane=chosen,
+            coin_id=base.lower(),
+            circulating_ratio=Decimal("0.8"),
+            history_days=days,
+            history_open=datetime(opened.year, opened.month, opened.day, tzinfo=UTC),
+            market_cap_rank=None if chosen is Lane.HIGH_RISK else 1,
+            fdv_to_market_cap=None if chosen is Lane.HIGH_RISK else Decimal("1.2"),
+            unlock_state="unavailable",
+            market_source_timestamp=NOW,
+            market_captured_at=NOW,
+            history_captured_at=NOW,
+            unlock_provider=None,
+            unlock_provider_id=None,
+            unlock_source_timestamp=None,
+        ),
+    )
+
+
 def test_a_finalized_session_is_not_captured_again(tmp_path: Path) -> None:
     manifest = tmp_path / "sessions/date=2026-10-07/manifest.json"
     manifest.parent.mkdir(parents=True)

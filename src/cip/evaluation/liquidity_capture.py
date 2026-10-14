@@ -279,6 +279,70 @@ def closed_hour_closes(payload: object, *, captured_at: datetime) -> tuple[Decim
     return tuple(closes)
 
 
+def build_liquidity(
+    symbol: str,
+    *,
+    session: date,
+    captured_at: datetime,
+    spread_bps: Decimal,
+    bid_usd: Decimal,
+    ask_usd: Decimal,
+    book_observed_at: datetime,
+    quote_volume: Decimal | None = None,
+    ticker_captured_at: datetime | None = None,
+    market_cap: Decimal | None = None,
+    aggregate_volume: Decimal | None = None,
+    market_source_timestamp: datetime | None = None,
+    hourly_closes: tuple[Decimal, ...] = (),
+    peg_limit: Decimal | None = None,
+    peg_captured_at: datetime | None = None,
+) -> LiquidityCapture:
+    """One session book plus stored prints. Closed-bar fields stay missing."""
+    derived = derive_liquidity(
+        (),
+        session,
+        binance_quote_volume=quote_volume,
+        market_cap=market_cap,
+        aggregate_volume=aggregate_volume,
+    )
+    pegged = (
+        peg_reading(hourly_closes, limit=peg_limit)
+        if hourly_closes and peg_limit is not None
+        else None
+    )
+    return LiquidityCapture(
+        symbol=symbol,
+        bars=(),
+        median_quote_volume_30d_usd=derived.median_quote_volume_30d_usd,
+        day_quote_volume_usd=derived.day_quote_volume_usd,
+        spread_bps=(spread_bps,),
+        median_spread_bps=_median([spread_bps]),
+        spread_snapshots=1,
+        bid_usd=bid_usd,
+        ask_usd=ask_usd,
+        depth_usd_per_side=min(bid_usd, ask_usd),
+        binance_quote_volume_24h=quote_volume,
+        market_cap_usd=market_cap,
+        aggregate_volume_usd=aggregate_volume,
+        turnover=derived.turnover,
+        volume_zscore=derived.volume_zscore,
+        price_move=derived.price_move,
+        taker_buy_ratio=None,
+        spike_candle_count=None,
+        trade_size_stdev=derived.trade_size_stdev,
+        binance_volume_share=derived.binance_volume_share,
+        stablecoin_peg_deviation=None if pegged is None else pegged[0],
+        peg_deviation_hours=None if pegged is None else pegged[1],
+        hourly_closes=hourly_closes if pegged is not None else (),
+        peg_limit=peg_limit if pegged is not None else None,
+        bar_captured_at=captured_at,
+        book_observed_at=book_observed_at,
+        ticker_captured_at=ticker_captured_at,
+        market_source_timestamp=market_source_timestamp,
+        peg_captured_at=peg_captured_at if pegged is not None else None,
+    )
+
+
 def store_liquidity(
     root: Path,
     session: date,
