@@ -249,6 +249,38 @@ def test_a_btc_month_without_the_session_bar_is_not_the_next_day() -> None:
     assert _assess(bars=bars).blocks == ("btc_session_bar_absent",)
 
 
+def test_an_open_symbol_still_requires_btc_bars_after_btc_settles() -> None:
+    snapshot = UniverseSnapshot(
+        session=SESSION,
+        symbols=("BTCUSDT", SYMBOL),
+        observed_at=CLOSE,
+        provenance="stored-exchange-info",
+    )
+    result = _assess(
+        snapshot=snapshot,
+        bars={SYMBOL: (_bar(SYMBOL, SESSION),)},
+        bar_months_present={SYMBOL: True},
+        candidates={SYMBOL: _candidate()},
+        candidate_files_present={SYMBOL: True},
+        settled={"BTCUSDT": ("policy_rejected", ("fan_token",))},
+    )
+    assert result.blocks == ("btc_bars_not_produced",)
+
+
+def test_a_settled_symbol_still_refuses_a_lookahead_bar() -> None:
+    result = _assess(
+        bars={
+            "BTCUSDT": (_bar("BTCUSDT", SESSION),),
+            SYMBOL: (_bar(SYMBOL, SESSION + timedelta(days=1)),),
+        },
+        bar_months_present={"BTCUSDT": True, SYMBOL: True},
+        candidates={},
+        candidate_files_present={},
+        settled={SYMBOL: ("policy_rejected", ("fan_token",))},
+    )
+    assert result.blocks == (f"bars_lookahead:{SYMBOL}",)
+
+
 def test_a_policy_rejection_does_not_require_downstream_bars() -> None:
     result = _assess(
         bars={"BTCUSDT": (_bar("BTCUSDT", SESSION),)},

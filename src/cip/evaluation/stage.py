@@ -37,11 +37,10 @@ def settle(
     """The stored terminal decision, or none when a later stage is still open."""
     facts = to_facts(item, quote_asset="USDT", status="TRADING")
     excluded = tuple(_exclusions(facts, universe))
-    if excluded:
-        return _settlement(excluded)
     chosen, reasons = _lane(facts, universe)
-    if chosen is None:
-        return _settlement(tuple(reasons))
+    if excluded or chosen is None:
+        paired = tuple(reasons) if chosen is None else ()
+        return _settlement(excluded + paired)
     if lane is None:
         return None
     overlaid = overlay_lane(
@@ -80,13 +79,17 @@ def load_universe() -> UniverseHypotheses:
 
 
 def settlements(
-    root: Path, session: date, symbols: tuple[str, ...]
+    root: Path,
+    session: date,
+    symbols: tuple[str, ...],
+    *,
+    sealed: bool = False,
 ) -> dict[str, tuple[str, tuple[str, ...]]]:
     """Terminal stages that do not need a later capture. Open symbols are omitted."""
     universe = load_universe()
     found: dict[str, tuple[str, tuple[str, ...]]] = {}
     for symbol in symbols:
-        loaded = load_symbol(root, session, symbol)
+        loaded = load_symbol(root, session, symbol, sealed=sealed)
         if loaded is None:
             continue
         item, lane = loaded
@@ -97,12 +100,16 @@ def settlements(
 
 
 def load_symbol(
-    root: Path, session: date, symbol: str
+    root: Path,
+    session: date,
+    symbol: str,
+    *,
+    sealed: bool = False,
 ) -> tuple[SymbolClassification, LaneFields | None] | None:
     """The stored classification and lane file. Missing classification is incomplete."""
     from cip.evaluation.lane_capture import _load_classification, _load_lane
 
-    path = _classification_path(root, session, symbol)
+    path = _classification_path(root, session, symbol, sealed=sealed)
     if not path.is_file():
         return None
     item = _load_classification(path)
@@ -110,7 +117,7 @@ def load_symbol(
         from cip.domain.errors import EvaluationError
 
         raise EvaluationError("capture is unusable")
-    lane_path = _lane_path(root, session, symbol)
+    lane_path = _lane_path(root, session, symbol, sealed=sealed)
     lane = _load_lane(lane_path) if lane_path.is_file() else None
     if lane is not None and lane.symbol != symbol:
         from cip.domain.errors import EvaluationError
@@ -128,11 +135,15 @@ def _settlement(codes: tuple[str, ...]) -> Settlement:
     return Settlement(kind, codes)
 
 
-def _classification_path(root: Path, session: date, symbol: str) -> Path:
-    folder = root / "captures" / f"session={session.isoformat()}" / "classification"
-    return folder / f"symbol={symbol}.json"
+def _classification_path(root: Path, session: date, symbol: str, *, sealed: bool) -> Path:
+    return _stage_dir(root, session, "classification", sealed=sealed) / f"symbol={symbol}.json"
 
 
-def _lane_path(root: Path, session: date, symbol: str) -> Path:
-    folder = root / "captures" / f"session={session.isoformat()}" / "lane"
-    return folder / f"symbol={symbol}.json"
+def _lane_path(root: Path, session: date, symbol: str, *, sealed: bool) -> Path:
+    return _stage_dir(root, session, "lane", sealed=sealed) / f"symbol={symbol}.json"
+
+
+def _stage_dir(root: Path, session: date, label: str, *, sealed: bool) -> Path:
+    if sealed:
+        return root / "sessions" / f"date={session.isoformat()}" / label
+    return root / "captures" / f"session={session.isoformat()}" / label

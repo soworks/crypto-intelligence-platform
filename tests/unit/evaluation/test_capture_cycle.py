@@ -476,7 +476,7 @@ def test_an_evidence_block_finalizes_without_downstream_bars(tmp_path: Path) -> 
     assert ready.finalized is True
     notes = ready.readiness.decision_notes
     assert any(note.startswith("evidence_blocked:BTCUSDT:missing_") for note in notes)
-    assert not any(note.startswith("policy_rejected:BTCUSDT:") for note in notes)
+    assert "policy_rejected:BTCUSDT:below_market_cap" in notes
     universe = json.loads((tmp_path / "sessions/date=2026-10-07/universe.json").read_text())
     assert universe["symbols"] == ["BTCUSDT"]
     assert not (tmp_path / "captures/session=2026-10-07/final/symbol=BTCUSDT.json").exists()
@@ -486,7 +486,7 @@ def test_an_evidence_block_finalizes_without_downstream_bars(tmp_path: Path) -> 
     assert held.calls == ()
     assert held.finalized is True
     assert manifest.read_bytes() == body
-    from cip.evaluation.populate import populate_session
+    from cip.evaluation.populate import populate_session, replay_session
     from cip.evaluation.prospect import load_closed
 
     again = populate_session(
@@ -499,6 +499,12 @@ def test_an_evidence_block_finalizes_without_downstream_bars(tmp_path: Path) -> 
     )
     assert again.manifest is not None
     assert again.readiness.ready is True
+    (tmp_path / "captures/session=2026-10-07/classification/symbol=BTCUSDT.json").unlink()
+    replayed = replay_session(tmp_path, OPEN)
+    assert replayed.readiness.ready is True
+    replay_notes = replayed.readiness.decision_notes
+    assert any(note.startswith("evidence_blocked:BTCUSDT:missing_") for note in replay_notes)
+    assert "policy_rejected:BTCUSDT:below_market_cap" in replay_notes
 
 
 def test_a_missing_classification_or_lane_file_is_not_ready(tmp_path: Path) -> None:

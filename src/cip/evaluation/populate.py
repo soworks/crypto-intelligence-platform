@@ -274,6 +274,8 @@ def _assess_stored(
     recorded = load_session(root, session)
     bars = _load_bars(root, session)
     observations, failures = _load_regime(root, session)
+    symbols = () if recorded.snapshot is None else recorded.snapshot.symbols
+    frozen = root / _stage_dir(session, "classification")
     return assess_session(
         session,
         as_of,
@@ -286,11 +288,7 @@ def _assess_stored(
         regime_failures=failures,
         weights_present=weights_present,
         bar_absences=recorded.bar_absences,
-        settled=settlements(
-            root,
-            session,
-            () if recorded.snapshot is None else recorded.snapshot.symbols,
-        ),
+        settled=settlements(root, session, symbols, sealed=True) if frozen.is_dir() else {},
     )
 
 
