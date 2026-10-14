@@ -12,15 +12,23 @@ import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Protocol
 
+from cip.adapters.market import Depth, DepthLevel
 from cip.domain.errors import EvaluationError
 from cip.domain.policy import UniverseHypotheses, load_policy
 from cip.evaluation.classification import SymbolClassification, store_classification
+from cip.evaluation.eligibility import Lane
 from cip.evaluation.lane_capture import ListingUnavailable, capture_lanes
-from cip.evaluation.liquidity_capture import HourQuote, spike_candle_count
+from cip.evaluation.liquidity_capture import (
+    HourQuote,
+    book_metrics,
+    build_liquidity,
+    spike_candle_count,
+    store_liquidity,
+)
 from cip.evaluation.populate import (
     BLOCKED_THROUGH,
     RegimeCapture,
@@ -258,6 +266,8 @@ def _pre_close(
         if not isinstance(payload, BookShot):
             raise EvaluationError("capture is unusable")
         store_session_book(root, session, symbol, payload)
+    if catalog_error is None and lane_error is None:
+        _acquire_liquidity(root, session, now, source, calls, retries)
     if catalog_error is not None:
         raise catalog_error
     if lane_error is not None:
@@ -288,6 +298,180 @@ def _lanes(
         return error
     retries.extend(f"listing:{symbol}" for symbol in pending)
     return None
+
+
+def _acquire_liquidity(
+    root: Path,
+    session: date,
+    now: datetime,
+    source: CaptureSource,
+    calls: list[tuple[str, str | None]],
+    retries: list[str],
+) -> None:
+    """One current book for each normal-lane passer. Older books are not copied."""
+    universe = load_universe()
+    loaded_policy = load_policy(_policy_path())
+    band = loaded_policy.policy.recorders.depth_band
+    rules = loaded_policy.policy.hypotheses.universe.manipulation
+    peg_limit = Decimal(str(rules.stablecoin_peg_deviation))
+    for symbol in _captured_symbols(root, session):
+        if _liquidity_path(root, session, symbol).is_file():
+            continue
+        loaded = load_symbol(root, session, symbol)
+        if loaded is None:
+            continue
+        item, lane = loaded
+        if lane is None or lane.lane is not Lane.NORMAL or settle(item, lane, universe) is not None:
+            continue
+        if not book_is_stored(root, session, symbol):
+            try:
+                payload = source.fetch(session, "book", symbol)
+            except TemporaryFailure:
+                retries.append(f"book:{symbol}")
+                continue
+            calls.append(("book", symbol))
+            if not isinstance(payload, BookShot):
+                raise EvaluationError("capture is unusable")
+            store_session_book(root, session, symbol, payload)
+        _store_passer_liquidity(root, session, now, symbol, item, band, peg_limit)
+
+
+def _store_passer_liquidity(
+    root: Path,
+    session: date,
+    now: datetime,
+    symbol: str,
+    item: SymbolClassification,
+    band: Decimal,
+    peg_limit: Decimal,
+) -> None:
+    document = json.loads(_book_path(root, session, symbol).read_text())
+    if not isinstance(document, dict):
+        raise EvaluationError("capture is unusable")
+    observed = _clock_of(document.get("captured_at"), "captured_at")
+    levels = _levels(document.get("bids")), _levels(document.get("asks"))
+    reading = book_metrics(
+        Depth(0, levels[0], levels[1]),
+        band=band,
+        observed_at=observed,
+    )
+    if reading is None:
+        return
+    quote, ticker_at = _ticker_quote(root, session, symbol)
+    closes, peg_at = _peg_closes(root, session)
+    aggregate = _aggregate_volume(root, session, item.coin_id, item.market_cap_source_timestamp)
+    store_liquidity(
+        root,
+        session,
+        build_liquidity(
+            symbol,
+            session=session,
+            captured_at=now,
+            spread_bps=reading.spread_bps,
+            bid_usd=reading.bid_usd,
+            ask_usd=reading.ask_usd,
+            book_observed_at=observed,
+            quote_volume=quote,
+            ticker_captured_at=ticker_at,
+            market_cap=item.market_cap_usd,
+            aggregate_volume=aggregate,
+            market_source_timestamp=item.market_cap_source_timestamp,
+            hourly_closes=closes,
+            peg_limit=peg_limit,
+            peg_captured_at=peg_at,
+        ),
+    )
+
+
+def _levels(value: object) -> tuple[DepthLevel, ...]:
+    if not isinstance(value, list):
+        raise EvaluationError("capture is unusable")
+    levels: list[DepthLevel] = []
+    for row in value:
+        if not isinstance(row, list) or len(row) != 2:
+            raise EvaluationError("capture is unusable")
+        levels.append(DepthLevel(_money(row[0]), _money(row[1])))
+    return tuple(levels)
+
+
+def _money(value: object) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise EvaluationError("capture is unusable")
+    try:
+        parsed = Decimal(str(value)) if isinstance(value, float) else Decimal(value)
+    except InvalidOperation as error:
+        raise EvaluationError("capture is unusable") from error
+    if not parsed.is_finite() or parsed < 0:
+        raise EvaluationError("capture is unusable")
+    return parsed
+
+
+def _ticker_quote(root: Path, session: date, symbol: str) -> tuple[Decimal | None, datetime | None]:
+    path = _ticker_path(root, session)
+    if not path.is_file():
+        return None, None
+    document = json.loads(path.read_text())
+    if not isinstance(document, dict):
+        return None, None
+    captured = _clock_of(document.get("captured_at"), "captured_at")
+    rows = document.get("rows")
+    if not isinstance(rows, list):
+        return None, None
+    for row in rows:
+        if not isinstance(row, dict) or row.get("symbol") != symbol:
+            continue
+        return _money(row.get("quote_volume")), captured
+    return None, None
+
+
+def _peg_closes(root: Path, session: date) -> tuple[tuple[Decimal, ...], datetime | None]:
+    path = _peg_path(root, session)
+    if not path.is_file():
+        return (), None
+    document = json.loads(path.read_text())
+    if not isinstance(document, dict):
+        return (), None
+    raw = document.get("closes")
+    if not isinstance(raw, list):
+        return (), None
+    captured = _clock_of(document.get("captured_at"), "captured_at")
+    return tuple(_money(value) for value in raw), captured
+
+
+def _aggregate_volume(
+    root: Path, session: date, coin_id: str | None, expected: datetime | None
+) -> Decimal | None:
+    if coin_id is None or expected is None:
+        return None
+    path = (
+        root
+        / "captures"
+        / f"session={session.isoformat()}"
+        / "classification_sources"
+        / "markets.json"
+    )
+    if not path.is_file():
+        return None
+    document = json.loads(path.read_text())
+    payload = document.get("payload") if isinstance(document, dict) else None
+    if not isinstance(payload, list):
+        return None
+    for row in payload:
+        if not isinstance(row, dict) or row.get("id") != coin_id:
+            continue
+        stamp = _clock_of(row.get("last_updated"), "last_updated")
+        if stamp != expected:
+            return None
+        return _money(row.get("total_volume"))
+    return None
+
+
+def _clock_of(value: object, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise EvaluationError("capture is unusable")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    _utc(parsed, label)
+    return parsed.astimezone(UTC)
 
 
 def _lane_universe() -> UniverseHypotheses | None:
