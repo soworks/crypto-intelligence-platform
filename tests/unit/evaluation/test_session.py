@@ -249,6 +249,45 @@ def test_a_btc_month_without_the_session_bar_is_not_the_next_day() -> None:
     assert _assess(bars=bars).blocks == ("btc_session_bar_absent",)
 
 
+def test_a_policy_rejection_does_not_require_downstream_bars() -> None:
+    result = _assess(
+        bars={"BTCUSDT": (_bar("BTCUSDT", SESSION),)},
+        bar_months_present={"BTCUSDT": True},
+        candidates={},
+        candidate_files_present={},
+        settled={SYMBOL: ("policy_rejected", ("fan_token", "missing_eur_stable_classification"))},
+    )
+    assert result.ready is True
+    assert result.blocks == ()
+    assert f"policy_rejected:{SYMBOL}:fan_token" in result.decision_notes
+    assert f"evidence_blocked:{SYMBOL}:missing_eur_stable_classification" in result.decision_notes
+
+
+def test_an_evidence_block_is_not_recorded_as_a_policy_rejection() -> None:
+    result = _assess(
+        bars={"BTCUSDT": (_bar("BTCUSDT", SESSION),)},
+        bar_months_present={"BTCUSDT": True},
+        candidates={},
+        candidate_files_present={},
+        settled={SYMBOL: ("evidence_blocked", ("missing_unlock_schedule",))},
+    )
+    assert result.ready is True
+    assert f"evidence_blocked:{SYMBOL}:missing_unlock_schedule" in result.decision_notes
+    assert not any(note.startswith(f"policy_rejected:{SYMBOL}:") for note in result.decision_notes)
+
+
+def test_a_settled_symbol_still_refuses_a_later_packet() -> None:
+    candidate = _candidate()
+    market = candidate.market.model_copy(update={"as_of": CLOSE + timedelta(seconds=1)})
+    later = candidate.model_copy(update={"market": market})
+    result = _assess(
+        candidates={SYMBOL: later},
+        candidate_files_present={SYMBOL: True},
+        settled={SYMBOL: ("policy_rejected", ("fan_token",))},
+    )
+    assert result.blocks == (f"candidate_lookahead:{SYMBOL}",)
+
+
 def test_a_symbol_without_a_month_file_is_not_produced() -> None:
     present = {"BTCUSDT": True, SYMBOL: False}
     assert _assess(bar_months_present=present).blocks == (f"bars_not_produced:{SYMBOL}",)

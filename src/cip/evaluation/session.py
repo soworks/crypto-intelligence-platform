@@ -61,6 +61,7 @@ def assess_session(
     regime_failures: frozenset[str],
     weights_present: bool,
     bar_absences: Mapping[str, bool] | None = None,
+    settled: Mapping[str, tuple[str, tuple[str, ...]]] | None = None,
 ) -> SessionReadiness:
     """Say whether this closed session can be evaluated. Do not evaluate it."""
     close = session_close(session)
@@ -70,6 +71,7 @@ def assess_session(
     if as_of < close:
         blocks.add("session_not_closed")
     symbols = _snapshot_symbols(snapshot, session, close, blocks)
+    finished = {} if settled is None else settled
     _bars(
         symbols,
         session,
@@ -78,8 +80,9 @@ def assess_session(
         {} if bar_absences is None else bar_absences,
         blocks,
         notes,
+        finished,
     )
-    _candidates(symbols, close, candidates, candidate_files_present, blocks, notes)
+    _candidates(symbols, close, candidates, candidate_files_present, blocks, notes, finished)
     _regime(session, close, observations, regime_failures, blocks)
     if not weights_present:
         notes.add("score_weights_not_frozen")
@@ -125,10 +128,12 @@ def _bars(
     absences: Mapping[str, bool],
     blocks: set[str],
     notes: set[str],
+    settled: Mapping[str, tuple[str, tuple[str, ...]]],
 ) -> None:
-    _one_symbol_bars(_BTC, session, bars, months_present, absences, blocks, notes, btc=True)
+    if _BTC not in settled:
+        _one_symbol_bars(_BTC, session, bars, months_present, absences, blocks, notes, btc=True)
     for symbol in symbols:
-        if symbol == _BTC:
+        if symbol == _BTC or symbol in settled:
             continue
         _one_symbol_bars(symbol, session, bars, months_present, absences, blocks, notes, btc=False)
 
@@ -173,8 +178,16 @@ def _candidates(
     files_present: Mapping[str, bool],
     blocks: set[str],
     notes: set[str],
+    settled: Mapping[str, tuple[str, tuple[str, ...]]],
 ) -> None:
     for symbol in symbols:
+        recorded = settled.get(symbol)
+        if recorded is not None:
+            for code in recorded[1]:
+                label = "evidence_blocked" if code.startswith("missing_") else "policy_rejected"
+                notes.add(f"{label}:{symbol}:{code}")
+        if recorded is not None and not files_present.get(symbol, False):
+            continue
         if not files_present.get(symbol, False):
             blocks.add(f"candidate_not_produced:{symbol}")
             continue

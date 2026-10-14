@@ -36,6 +36,7 @@ from cip.evaluation.prospect import (
     store_universe,
 )
 from cip.evaluation.session import SessionReadiness, session_close
+from cip.evaluation.stage import load_symbol, load_universe, needs_lane, settle
 from cip.history.bars import DailyBar
 
 _SEALED = date(2026, 10, 6)
@@ -452,16 +453,25 @@ def _stage_ready(root: Path, session: date) -> bool:
     raw = document.get("symbols") if isinstance(document, dict) else None
     if not isinstance(raw, list) or not raw or any(not isinstance(symbol, str) for symbol in raw):
         return False
-    return all(_symbol_ready(root, session, symbol) for symbol in raw)
+    policy = load_universe()
+    return all(_symbol_ready(root, session, symbol, policy) for symbol in raw)
 
 
-def _symbol_ready(root: Path, session: date, symbol: str) -> bool:
+def _symbol_ready(root: Path, session: date, symbol: str, universe: UniverseHypotheses) -> bool:
+    """Downstream files are required only while the deterministic path is still open."""
+    loaded = load_symbol(root, session, symbol)
+    if loaded is None:
+        return False
+    item, lane = loaded
+    if settle(item, lane, universe) is not None:
+        return True
+    if needs_lane(item, universe) and lane is None:
+        return False
     return (
         _final_path(root, session, symbol).is_file()
         and _hours_path(root, session, symbol).is_file()
         and _packet_path(root, session, symbol).is_file()
         and book_is_stored(root, session, symbol)
-        and _classification_path(root, session, symbol).is_file()
     )
 
 
