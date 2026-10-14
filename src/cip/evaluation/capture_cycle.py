@@ -17,8 +17,9 @@ from pathlib import Path
 from typing import Protocol
 
 from cip.domain.errors import EvaluationError
-from cip.domain.policy import load_policy
+from cip.domain.policy import UniverseHypotheses, load_policy
 from cip.evaluation.classification import SymbolClassification, store_classification
+from cip.evaluation.lane_capture import ListingUnavailable, capture_lanes
 from cip.evaluation.liquidity_capture import HourQuote, spike_candle_count
 from cip.evaluation.populate import (
     BLOCKED_THROUGH,
@@ -163,7 +164,7 @@ def run_capture_cycle(
     if cycle.pre_close is not None and _manifest(root, cycle.pre_close).is_file():
         skipped.append(f"finalized:{cycle.pre_close.isoformat()}")
     elif cycle.pre_close is not None:
-        _pre_close(root, cycle.pre_close, source, symbols, calls, skipped, retries)
+        _pre_close(root, cycle.pre_close, cycle.now, source, symbols, calls, skipped, retries)
     if cycle.post_close is not None and _manifest(root, cycle.post_close).is_file():
         skipped.append(f"finalized:{cycle.post_close.isoformat()}")
     elif cycle.post_close is not None:
@@ -193,6 +194,7 @@ def _belongs(session: date, captured_at: datetime) -> None:
 def _pre_close(
     root: Path,
     session: date,
+    now: datetime,
     source: CaptureSource,
     symbols: tuple[str, ...],
     calls: list[tuple[str, str | None]],
@@ -229,6 +231,19 @@ def _pre_close(
             retries.append(f"classification:{symbol}")
             continue
         catalog_failed = len(retries) > before
+    lane_error: EvaluationError | None = None
+    universe = None if catalog_failed else _lane_universe()
+    if universe is not None:
+        lane_error = _lanes(
+            root,
+            session,
+            now,
+            source,
+            _captured_symbols(root, session),
+            universe,
+            calls,
+            retries,
+        )
     for symbol in symbols:
         if book_is_stored(root, session, symbol):
             skipped.append(f"book:{symbol}")
@@ -244,6 +259,41 @@ def _pre_close(
         store_session_book(root, session, symbol, payload)
     if catalog_error is not None:
         raise catalog_error
+    if lane_error is not None:
+        raise lane_error
+
+
+def _lanes(
+    root: Path,
+    session: date,
+    now: datetime,
+    source: CaptureSource,
+    symbols: tuple[str, ...],
+    universe: UniverseHypotheses,
+    calls: list[tuple[str, str | None]],
+    retries: list[str],
+) -> EvaluationError | None:
+    def fetch_listing(symbol: str) -> object:
+        try:
+            payload = source.fetch(session, "listing", symbol)
+        except TemporaryFailure as error:
+            raise ListingUnavailable(str(error)) from error
+        calls.append(("listing", symbol))
+        return payload
+
+    try:
+        pending = capture_lanes(root, session, now, symbols, universe, fetch_listing)
+    except EvaluationError as error:
+        return error
+    retries.extend(f"listing:{symbol}" for symbol in pending)
+    return None
+
+
+def _lane_universe() -> UniverseHypotheses | None:
+    raw = os.environ.get("POLICY_PATH")
+    if not raw:
+        return None
+    return load_policy(Path(raw)).policy.hypotheses.universe
 
 
 def _post_close(

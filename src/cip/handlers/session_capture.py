@@ -93,7 +93,9 @@ _TRADING = re.compile(r"^[A-Z0-9]{1,20}$")
 _DEPTH_LIMIT = 100
 _PEG_LIMIT = 30
 _DAILY_LIMIT = 40
-_OPEN_KINDS = frozenset({"universe", "ticker", "peg", "regime", "book", "classification"})
+_OPEN_KINDS = frozenset(
+    {"universe", "ticker", "peg", "regime", "book", "classification", "listing"}
+)
 _BAR_KINDS = frozenset({"book", "daily_bars", "hour_bars"})
 
 
@@ -186,6 +188,8 @@ class EvidenceSource:
             return self._peg(session)
         if kind == "regime":
             return self._regime(session, symbol)
+        if kind == "listing":
+            return self._listing(session, _trading_symbol(symbol))
         if kind in _BAR_KINDS:
             return self._named(session, kind, _trading_symbol(symbol))
         raise TemporaryFailure("capture kind is not collected")
@@ -346,6 +350,21 @@ class EvidenceSource:
         if kind == "daily_bars":
             return self._daily(session, symbol)
         return self._hours(session, symbol)
+
+    def _listing(self, session: date, symbol: str) -> object:
+        """The earliest daily open at or before this session. Later candles are excluded."""
+        close = session_close(session)
+        self.calls.append(f"GET /api/v3/klines {symbol} listing")
+        return self._reader(
+            f"{self._base}/api/v3/klines",
+            {
+                "endTime": str(_ms(close) - 1),
+                "interval": "1d",
+                "limit": "1",
+                "startTime": "0",
+                "symbol": symbol,
+            },
+        )
 
     def _daily(self, session: date, symbol: str) -> tuple[DailyBar, ...]:
         close = session_close(session)
