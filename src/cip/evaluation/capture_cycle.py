@@ -420,7 +420,10 @@ def _ticker_quote(root: Path, session: date, symbol: str) -> tuple[Decimal | Non
     for row in rows:
         if not isinstance(row, dict) or row.get("symbol") != symbol:
             continue
-        return _money(row.get("quote_volume")), captured
+        amount = _optional_money(row.get("quote_volume"))
+        if amount is None:
+            return None, None
+        return amount, captured
     return None, None
 
 
@@ -459,11 +462,23 @@ def _aggregate_volume(
     for row in payload:
         if not isinstance(row, dict) or row.get("id") != coin_id:
             continue
-        stamp = _clock_of(row.get("last_updated"), "last_updated")
-        if stamp != expected:
+        stamp = _optional_clock(row.get("last_updated"), "last_updated")
+        if stamp is None or stamp != expected:
             return None
-        return _money(row.get("total_volume"))
+        return _optional_money(row.get("total_volume"))
     return None
+
+
+def _optional_money(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    return _money(value)
+
+
+def _optional_clock(value: object, label: str) -> datetime | None:
+    if value is None:
+        return None
+    return _clock_of(value, label)
 
 
 def _clock_of(value: object, label: str) -> datetime:
