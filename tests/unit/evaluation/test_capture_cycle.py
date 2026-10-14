@@ -2,6 +2,7 @@ import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -12,6 +13,7 @@ from cip.evaluation.capture_cycle import (
     BookShot,
     CycleReport,
     TemporaryFailure,
+    _bars_of,
     _one_bar,
     _policy_path,
     _post_close,
@@ -833,6 +835,7 @@ def _passer(
     lane: object,
     *,
     days: int,
+    unlock: Literal["future_unlocks", "no_applicable_future_unlock", "unavailable"] = "unavailable",
 ) -> None:
     from cip.evaluation.classification import store_classification
     from cip.evaluation.eligibility import Lane
@@ -874,15 +877,159 @@ def _passer(
             history_open=datetime(opened.year, opened.month, opened.day, tzinfo=UTC),
             market_cap_rank=None if chosen is Lane.HIGH_RISK else 1,
             fdv_to_market_cap=None if chosen is Lane.HIGH_RISK else Decimal("1.2"),
-            unlock_state="unavailable",
+            unlock_state=unlock,
             market_source_timestamp=NOW,
             market_captured_at=NOW,
             history_captured_at=NOW,
-            unlock_provider=None,
-            unlock_provider_id=None,
-            unlock_source_timestamp=None,
+            unlock_provider=None if unlock == "unavailable" else "tokenomist",
+            unlock_provider_id=None if unlock == "unavailable" else base.lower(),
+            unlock_source_timestamp=None if unlock == "unavailable" else NOW,
         ),
     )
+
+
+def test_a_closed_passer_stores_the_completed_bar_window(tmp_path: Path) -> None:
+    from cip.evaluation.eligibility import Lane
+    from cip.evaluation.liquidity_capture import derive_liquidity
+    from cip.evaluation.prospect import store_universe
+
+    store_universe(tmp_path, OPEN, universe_capture(OPEN, _info(), NOW, NOW))
+    universe = tmp_path / "captures/session=2026-10-07/universe.json"
+    document = json.loads(universe.read_text())
+    document["symbols"] = [
+        "BADUSDT",
+        "ODDUSDT",
+        "PASSUSDT",
+        "HIGHUSDT",
+        "SHORTUSDT",
+        "NOLANEUSDT",
+        "ABSENTUSDT",
+    ]
+    universe.write_text(json.dumps(document))
+    _passer(tmp_path, "PASSUSDT", "PASS", Decimal("1000000000"), Lane.NORMAL, days=400)
+    _passer(
+        tmp_path,
+        "HIGHUSDT",
+        "HIGH",
+        Decimal("100000000"),
+        Lane.HIGH_RISK,
+        days=200,
+        unlock="future_unlocks",
+    )
+    _passer(tmp_path, "SHORTUSDT", "SHORT", Decimal("1000000000"), Lane.NORMAL, days=10)
+    _passer(tmp_path, "NOLANEUSDT", "NOLANE", Decimal("1000000000"), None, days=400)
+    _passer(tmp_path, "BADUSDT", "BAD", Decimal("1000000000"), Lane.NORMAL, days=400)
+    _passer(tmp_path, "ODDUSDT", "ODD", Decimal("1000000000"), Lane.NORMAL, days=400)
+    _rewrite(
+        tmp_path / "captures/session=2026-10-07/classification/symbol=BADUSDT.json",
+        "symbol",
+        "OTHER",
+    )
+    _rewrite(
+        tmp_path / "captures/session=2026-10-07/lane/symbol=ODDUSDT.json",
+        "unlock_state",
+        "future_unlocks",
+    )
+    last = Decimal("10000")
+    earlier = [Decimal("2400")] * 28
+    quotes = [*earlier, Decimal("1000"), Decimal("2400"), Decimal("1200"), last]
+    daily = _named_days("PASSUSDT", OPEN, quotes)
+    hours = _hours(OPEN, (Decimal("100"),) * 23 + (Decimal("7700"),))
+    answers: Answers = {
+        (OPEN, "daily_bars", "PASSUSDT"): daily,
+        (OPEN, "hour_bars", "PASSUSDT"): hours,
+    }
+    failed = {(OPEN, "daily_bars", "BTCUSDT")}
+    fresh = Source(answers, fail=failed)
+    report = run_capture_cycle(tmp_path, AFTER, fresh, ("BTCUSDT", "PASSUSDT"), requested=OPEN)
+    assert "daily_bars:BTCUSDT" in report.retries
+    assert fresh.calls.count(("daily_bars", "PASSUSDT", OPEN)) == 1
+    assert fresh.calls.count(("hour_bars", "PASSUSDT", OPEN)) == 1
+    blocked = {"HIGHUSDT", "SHORTUSDT", "NOLANEUSDT", "ABSENTUSDT", "BADUSDT", "ODDUSDT"}
+    assert not any(symbol in blocked for _kind, symbol, _session in fresh.calls)
+    final = tmp_path / "captures/session=2026-10-07/final/symbol=PASSUSDT.json"
+    hour_path = tmp_path / "captures/session=2026-10-07/hours/symbol=PASSUSDT.json"
+    stored = _bars_of(final)
+    stored_hours = json.loads(hour_path.read_text())
+    assert len(stored_hours["hours"]) == 24
+    assert stored_hours["spike_candle_count"] is not None
+    assert not (tmp_path / "captures/session=2026-10-07/final/symbol=HIGHUSDT.json").exists()
+    derived = derive_liquidity(stored, OPEN)
+    assert derived.median_quote_volume_30d_usd is not None
+    assert derived.day_quote_volume_usd is not None
+    assert derived.volume_zscore is not None
+    assert derived.price_move is not None
+    assert derived.trade_size_stdev is not None
+    session_bar = next(bar for bar in stored if bar.open_date == OPEN)
+    assert session_bar.quote_volume == Decimal("10000")
+    ratio = session_bar.taker_buy_quote_volume / session_bar.quote_volume
+    assert Decimal(0) <= ratio <= 1
+    follow = Source({}, fail=failed)
+    again = run_capture_cycle(tmp_path, AFTER, follow, ("BTCUSDT", "PASSUSDT"), requested=OPEN)
+    assert "daily_bars:PASSUSDT" in again.skipped
+    assert "hour_bars:PASSUSDT" in again.skipped
+    assert not any(symbol == "PASSUSDT" for _kind, symbol, _session in follow.calls)
+
+
+def test_an_open_session_does_not_fetch_completed_bars(tmp_path: Path) -> None:
+    from cip.evaluation.eligibility import Lane
+    from cip.evaluation.prospect import store_universe
+
+    store_universe(tmp_path, OPEN, universe_capture(OPEN, _info(), NOW, NOW))
+    universe = tmp_path / "captures/session=2026-10-07/universe.json"
+    document = json.loads(universe.read_text())
+    document["symbols"] = ["PASSUSDT"]
+    universe.write_text(json.dumps(document))
+    _passer(tmp_path, "PASSUSDT", "PASS", Decimal("1000000000"), Lane.NORMAL, days=400)
+    source = Source({})
+
+    def refuse(session: date, kind: str, symbol: str | None) -> object:
+        source.calls.append((kind, symbol, session))
+        raise TemporaryFailure("provider")
+
+    source.fetch = refuse  # type: ignore[method-assign]
+    run_capture_cycle(tmp_path, NOW, source, ("BTCUSDT",))
+    assert not any(kind in {"daily_bars", "hour_bars"} for kind, _symbol, _session in source.calls)
+
+
+def test_a_broken_universe_does_not_block_the_btc_bar(tmp_path: Path) -> None:
+    path = tmp_path / "captures/session=2026-10-07/universe.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{")
+    failed = {(OPEN, "daily_bars", "BTCUSDT")}
+    report = run_capture_cycle(
+        tmp_path, AFTER, Source({}, fail=failed), ("BTCUSDT",), requested=OPEN
+    )
+    assert "daily_bars:BTCUSDT" in report.retries
+
+
+def _rewrite(path: Path, key: str, value: str) -> None:
+    document = json.loads(path.read_text())
+    document[key] = value
+    path.write_text(json.dumps(document))
+
+
+def _named_days(symbol: str, event: date, quotes: list[Decimal]) -> tuple[DailyBar, ...]:
+    start = event - timedelta(days=len(quotes) - 1)
+    bars: list[DailyBar] = []
+    for index, quote in enumerate(quotes):
+        price = Decimal("10")
+        bars.append(
+            DailyBar(
+                symbol=symbol,
+                open_date=start + timedelta(days=index),
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=Decimal("1"),
+                quote_volume=quote,
+                trade_count=1,
+                taker_buy_base_volume=Decimal("1"),
+                taker_buy_quote_volume=Decimal("1"),
+            )
+        )
+    return tuple(bars)
 
 
 def test_a_finalized_session_is_not_captured_again(tmp_path: Path) -> None:
