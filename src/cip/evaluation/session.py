@@ -130,12 +130,32 @@ def _bars(
     notes: set[str],
     settled: Mapping[str, tuple[str, tuple[str, ...]]],
 ) -> None:
-    if _BTC not in settled:
-        _one_symbol_bars(_BTC, session, bars, months_present, absences, blocks, notes, btc=True)
+    still_open = any(symbol != _BTC and symbol not in settled for symbol in symbols)
+    _one_symbol_bars(
+        _BTC,
+        session,
+        bars,
+        months_present,
+        absences,
+        blocks,
+        notes,
+        btc=True,
+        required=_BTC not in settled or still_open,
+    )
     for symbol in symbols:
-        if symbol == _BTC or symbol in settled:
+        if symbol == _BTC:
             continue
-        _one_symbol_bars(symbol, session, bars, months_present, absences, blocks, notes, btc=False)
+        _one_symbol_bars(
+            symbol,
+            session,
+            bars,
+            months_present,
+            absences,
+            blocks,
+            notes,
+            btc=False,
+            required=symbol not in settled,
+        )
 
 
 def _one_symbol_bars(
@@ -148,6 +168,7 @@ def _one_symbol_bars(
     notes: set[str],
     *,
     btc: bool,
+    required: bool,
 ) -> None:
     series = bars.get(symbol, ())
     if any(bar.symbol != symbol for bar in series):
@@ -157,6 +178,8 @@ def _one_symbol_bars(
         blocks.add(f"duplicate_bar_date:{symbol}")
     if any(bar.open_date > session for bar in series):
         blocks.add(f"bars_lookahead:{symbol}")
+    if not required:
+        return
     if not months_present.get(symbol, False):
         if not btc and absences.get(symbol, False):
             notes.add(f"daily_bar_absent:{symbol}")

@@ -10,7 +10,7 @@ from cip.domain.policy import load_policy
 from cip.evaluation.classification import SymbolClassification, store_classification
 from cip.evaluation.eligibility import Lane
 from cip.evaluation.lane_fields import LaneFields, store_lane
-from cip.evaluation.stage import load_symbol, needs_lane, settle
+from cip.evaluation.stage import load_symbol, needs_lane, settle, settlements
 
 SESSION = date(2026, 10, 7)
 NOW = datetime(2026, 10, 7, 19, tzinfo=UTC)
@@ -18,6 +18,20 @@ OPEN = datetime(2017, 8, 17, tzinfo=UTC)
 UNIVERSE = load_policy(
     Path(__file__).resolve().parents[3] / "policies" / "investment-policy.yaml"
 ).policy.hypotheses.universe
+
+
+def test_an_exclusion_keeps_a_classification_cap_reason() -> None:
+    missing = settle(_item(fan_token=True, cap=None), None, UNIVERSE)
+    assert missing is not None
+    assert missing.kind == "policy_rejected"
+    assert missing.reason_codes == ("fan_token", "missing_market_cap")
+    below = settle(_item(eur_stable=None, cap=Decimal("1000")), None, UNIVERSE)
+    assert below is not None
+    assert below.kind == "policy_rejected"
+    assert below.reason_codes == ("missing_eur_stable_classification", "below_market_cap")
+    flagged = settle(_item(fan_token=True), None, UNIVERSE)
+    assert flagged is not None
+    assert flagged.reason_codes == ("fan_token",)
 
 
 def test_an_exclusion_policy_rejection_is_terminal() -> None:
@@ -77,6 +91,19 @@ def test_a_missing_unlock_schedule_stays_evidence_blocked() -> None:
     assert settled is not None
     assert settled.kind == "evidence_blocked"
     assert settled.reason_codes == ("missing_unlock_schedule",)
+
+
+def test_replay_reads_the_sealed_copy_and_not_a_later_capture(tmp_path: Path) -> None:
+    store_classification(tmp_path, SESSION, _item(fan_token=True, cap=None), NOW)
+    assert settlements(tmp_path, SESSION, ("BTCUSDT",), sealed=True) == {}
+    source = tmp_path / "captures/session=2026-10-07/classification/symbol=BTCUSDT.json"
+    sealed = tmp_path / "sessions/date=2026-10-07/classification"
+    sealed.mkdir(parents=True)
+    (sealed / source.name).write_bytes(source.read_bytes())
+    source.unlink()
+    assert settlements(tmp_path, SESSION, ("BTCUSDT",)) == {}
+    replayed = settlements(tmp_path, SESSION, ("BTCUSDT",), sealed=True)
+    assert replayed["BTCUSDT"][1] == ("fan_token", "missing_market_cap")
 
 
 def test_loading_requires_the_symbol_in_the_file(tmp_path: Path) -> None:
