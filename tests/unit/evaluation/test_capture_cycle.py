@@ -788,6 +788,16 @@ def test_a_book_that_is_not_a_shot_is_refused(tmp_path: Path) -> None:
     assert _aggregate_volume(tmp_path, OPEN, "pass", NOW) is None
     markets.write_text(json.dumps({"payload": [{"id": "other"}]}))
     assert _aggregate_volume(tmp_path, OPEN, "pass", NOW) is None
+    markets.write_text(json.dumps({"payload": [{"id": "pass"}]}))
+    assert _aggregate_volume(tmp_path, OPEN, "pass", NOW) is None
+    markets.write_text(
+        json.dumps({"payload": [{"id": "pass", "last_updated": "2026-10-07T19:00:00Z"}]})
+    )
+    assert _aggregate_volume(tmp_path, OPEN, "pass", NOW) is None
+    ticker.write_text(
+        json.dumps({"captured_at": "2026-10-07T19:00:00Z", "rows": [{"symbol": "PASSUSDT"}]})
+    )
+    assert _ticker_quote(tmp_path, OPEN, "PASSUSDT") == (None, None)
     from cip.evaluation.liquidity_capture import build_liquidity
 
     empty = build_liquidity(
