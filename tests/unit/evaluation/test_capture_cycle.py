@@ -775,3 +775,161 @@ def test_a_stored_bar_file_must_still_parse(tmp_path: Path) -> None:
     assert "prod_decisions_started_at" not in text
     assert "score_v2_shadow_started_at" not in text
     assert "prod_shadow_started_at" not in text
+
+
+def test_lane_evidence_runs_after_classification_and_before_the_book(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(
+        "POLICY_PATH",
+        str(Path(__file__).resolve().parents[3] / "policies" / "investment-policy.yaml"),
+    )
+    root = tmp_path / "lanes"
+    session = "2026-10-07"
+    folder = root / f"captures/session={session}"
+    for name in ("ticker.json", "peg/symbol=USDCUSDT.json"):
+        path = folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    for series in ("btc_dominance", "stablecoin_supply"):
+        path = folder / "regime" / f"{series}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    (folder / "universe.json").write_text(json.dumps({"symbols": ["BTCUSDT", "LOWUSDT"]}))
+    from cip.evaluation.classification import store_classification
+    from cip.evaluation.classification_bundle import store_component
+
+    stamp = datetime(2026, 10, 7, 18, tzinfo=UTC)
+    store_classification(root, OPEN, _stored("BTCUSDT", "BTC", Decimal("1000000000")), NOW)
+    store_classification(root, OPEN, _stored("LOWUSDT", "LOW", Decimal("1000")), NOW)
+    store_component(
+        root,
+        OPEN,
+        "markets",
+        [
+            {
+                "circulating_supply": "80",
+                "fully_diluted_valuation": "500",
+                "id": "bitcoin",
+                "last_updated": "2026-10-07T18:00:00Z",
+                "market_cap": "400",
+                "market_cap_rank": 4,
+                "total_supply": "100",
+            }
+        ],
+        NOW,
+    )
+    answers: Answers = {
+        (OPEN, "book", "BTCUSDT"): BookShot(Decimal("1"), stamp, NOW),
+        (OPEN, "listing", "BTCUSDT"): [[1_502_928_000_000]],
+    }
+    source = Source(answers)
+    report = run_capture_cycle(root, NOW, source, ("BTCUSDT",))
+    assert ("listing", "BTCUSDT", OPEN) in source.calls
+    assert ("listing", "LOWUSDT", OPEN) not in source.calls
+    assert ("book", "BTCUSDT", OPEN) in source.calls
+    assert report.retries == ()
+    assert (folder / "lane/symbol=BTCUSDT.json").is_file()
+    assert (folder / "candidates/symbol=BTCUSDT.json").is_file()
+    assert not (folder / "lane/symbol=LOWUSDT.json").exists()
+
+
+def test_a_listing_failure_is_a_retry_and_the_book_still_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(
+        "POLICY_PATH",
+        str(Path(__file__).resolve().parents[3] / "policies" / "investment-policy.yaml"),
+    )
+    root = tmp_path / "retry"
+    folder = root / "captures/session=2026-10-07"
+    for name in ("ticker.json", "peg/symbol=USDCUSDT.json"):
+        path = folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    for series in ("btc_dominance", "stablecoin_supply"):
+        path = folder / "regime" / f"{series}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    (folder / "universe.json").write_text(json.dumps({"symbols": ["BTCUSDT"]}))
+    from cip.evaluation.classification import store_classification
+
+    store_classification(root, OPEN, _stored("BTCUSDT", "BTC", Decimal("1000000000")), NOW)
+    source = Source(
+        {(OPEN, "book", "BTCUSDT"): BookShot(Decimal("1"), None, NOW)},
+        fail={(OPEN, "listing", "BTCUSDT")},
+    )
+    report = run_capture_cycle(root, NOW, source, ("BTCUSDT",))
+    assert report.retries == ("listing:BTCUSDT",)
+    assert ("book", "BTCUSDT", OPEN) in source.calls
+    assert not (folder / "lane/symbol=BTCUSDT.json").exists()
+
+
+def test_a_lane_conflict_is_reported_after_the_book(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(
+        "POLICY_PATH",
+        str(Path(__file__).resolve().parents[3] / "policies" / "investment-policy.yaml"),
+    )
+    root = tmp_path / "conflict"
+    folder = root / "captures/session=2026-10-07"
+    _skip_files(folder)
+    (folder / "universe.json").write_text(json.dumps({"symbols": ["BTCUSDT"]}))
+    from cip.evaluation.classification import store_classification
+    from cip.evaluation.classification_bundle import store_component
+
+    store_classification(root, OPEN, _stored("BTCUSDT", "BTC", Decimal("1000000000")), NOW)
+    store_component(
+        root,
+        OPEN,
+        "markets",
+        [
+            {
+                "circulating_supply": "80",
+                "fully_diluted_valuation": "500",
+                "id": "bitcoin",
+                "last_updated": "2026-10-08T00:00:01Z",
+                "market_cap": "400",
+                "market_cap_rank": 4,
+                "total_supply": "100",
+            }
+        ],
+        NOW,
+    )
+    source = Source({(OPEN, "book", "BTCUSDT"): BookShot(Decimal("1"), None, NOW)})
+    with pytest.raises(EvaluationError, match="after the close"):
+        run_capture_cycle(root, NOW, source, ("BTCUSDT",))
+    assert ("book", "BTCUSDT", OPEN) in source.calls
+    assert ("listing", "BTCUSDT", OPEN) not in source.calls
+
+
+def _skip_files(folder: Path) -> None:
+    for name in ("ticker.json", "peg/symbol=USDCUSDT.json", "regime/btc_dominance.json"):
+        path = folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    path = folder / "regime/stablecoin_supply.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}")
+
+
+def _stored(symbol: str, base: str, cap: Decimal) -> SymbolClassification:
+    return SymbolClassification(
+        symbol=symbol,
+        base_asset=base,
+        eur_stable=False,
+        fan_token=False,
+        monitoring_tag=False,
+        delisting=False,
+        deposits_suspended=False,
+        withdrawals_suspended=False,
+        pending_migration=False,
+        coin_id="bitcoin",
+        mapping="unambiguous",
+        market_cap_usd=cap,
+        market_cap_source_timestamp=datetime(2026, 10, 7, 18, tzinfo=UTC),
+        cmc_id=None,
+        cmc_market_cap_usd=None,
+        cmc_source_timestamp=None,
+    )

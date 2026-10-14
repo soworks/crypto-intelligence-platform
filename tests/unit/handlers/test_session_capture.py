@@ -1016,3 +1016,31 @@ def test_the_workload_is_capture_only() -> None:
     assert "ssm:" not in terraform
     assert "s3:DeleteObject" in terraform
     assert "run_daily_scan" not in (REPO / "terraform/environments/prod/main.tf").read_text()
+
+
+def test_listing_open_is_the_earliest_daily_candle_inside_the_session() -> None:
+    seen: dict[str, str] = {}
+
+    def reader(_url: str, params: dict[str, str] | None) -> object:
+        assert params is not None
+        seen.update(params)
+        return [[1_502_928_000_000]]
+
+    source = EvidenceSource(_Spot(), NOW, Decimal("0.02"), BASE, reader)
+    assert source.fetch(OPEN, "listing", "BTCUSDT") == [[1_502_928_000_000]]
+    close_ms = int(session_close(OPEN).timestamp() * 1000)
+    assert seen["startTime"] == "0"
+    assert seen["endTime"] == str(close_ms - 1)
+    assert seen["interval"] == "1d"
+    assert seen["limit"] == "1"
+    assert seen["symbol"] == "BTCUSDT"
+    assert "GET /api/v3/klines BTCUSDT listing" in source.calls
+
+
+def test_listing_after_the_close_does_not_call_the_provider() -> None:
+    def reader(_url: str, _params: dict[str, str] | None) -> object:
+        raise AssertionError("listing was requested")
+
+    source = EvidenceSource(_Spot(), AFTER, Decimal("0.02"), BASE, reader)
+    with pytest.raises(TemporaryFailure, match="after the close"):
+        source.fetch(OPEN, "listing", "BTCUSDT")
