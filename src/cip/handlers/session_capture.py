@@ -541,18 +541,51 @@ def _upload(
 
 def _download(client: Any, bucket: str, root: Path, now: datetime) -> dict[str, bytes]:
     stored: dict[str, bytes] = {}
-    for prefix in evidence_prefixes(now):
-        for key in _list(client, bucket, prefix):
-            if _sealed(key):
-                continue
-            body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
-            if not isinstance(body, bytes):
-                raise EvaluationError("capture is unusable")
-            path = root / key
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(body)
-            stored[key] = body
+    keys = [key for prefix in evidence_prefixes(now) for key in _list(client, bucket, prefix)]
+    keys.extend(key for key in _history_book_keys(client, bucket, now) if key not in keys)
+    for key in keys:
+        if _sealed(key):
+            continue
+        body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
+        if not isinstance(body, bytes):
+            raise EvaluationError("capture is unusable")
+        path = root / key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body)
+        stored[key] = body
     return stored
+
+
+def _history_book_keys(client: Any, bucket: str, now: datetime) -> tuple[str, ...]:
+    """Book objects on or before the open session. Later sessions are not read."""
+    _utc(now)
+    opened = now.astimezone(UTC).date()
+    keys: list[str] = []
+    for day in _listed_sessions(client, bucket):
+        if day > opened or day <= BLOCKED_THROUGH or day == _SEALED:
+            continue
+        prefix = f"captures/session={day.isoformat()}/book/"
+        keys.extend(key for key in _list(client, bucket, prefix) if key.startswith(prefix))
+    return tuple(keys)
+
+
+def _listed_sessions(client: Any, bucket: str) -> tuple[date, ...]:
+    found: list[date] = []
+    token: str | None = None
+    while True:
+        page = client.list_objects_v2(**_page(bucket, "captures/", token, delimiter="/"))
+        for item in page.get("CommonPrefixes") or []:
+            prefix = str(item.get("Prefix", ""))
+            marker = "captures/session="
+            if not prefix.startswith(marker) or not prefix.endswith("/"):
+                continue
+            try:
+                found.append(date.fromisoformat(prefix[len(marker) : -1]))
+            except ValueError:
+                continue
+        if not page.get("IsTruncated"):
+            return tuple(found)
+        token = str(page["NextContinuationToken"])
 
 
 def _list(client: Any, bucket: str, prefix: str) -> tuple[str, ...]:
@@ -566,10 +599,14 @@ def _list(client: Any, bucket: str, prefix: str) -> tuple[str, ...]:
         token = str(page["NextContinuationToken"])
 
 
-def _page(bucket: str, prefix: str, token: str | None) -> dict[str, str]:
+def _page(
+    bucket: str, prefix: str, token: str | None, *, delimiter: str | None = None
+) -> dict[str, str]:
     params = {"Bucket": bucket, "Prefix": prefix}
     if token is not None:
         params["ContinuationToken"] = token
+    if delimiter is not None:
+        params["Delimiter"] = delimiter
     return params
 
 
