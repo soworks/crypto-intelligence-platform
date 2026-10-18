@@ -836,6 +836,7 @@ def _passer(
     *,
     days: int,
     unlock: Literal["future_unlocks", "no_applicable_future_unlock", "unavailable"] = "unavailable",
+    session: date = OPEN,
 ) -> None:
     from cip.evaluation.classification import store_classification
     from cip.evaluation.eligibility import Lane
@@ -859,14 +860,14 @@ def _passer(
         cmc_market_cap_usd=None,
         cmc_source_timestamp=None,
     )
-    store_classification(root, OPEN, item, NOW)
+    store_classification(root, session, item, NOW)
     if lane is None:
         return
     chosen = Lane.NORMAL if lane is Lane.NORMAL else Lane.HIGH_RISK
-    opened = OPEN - timedelta(days=days)
+    opened = session - timedelta(days=days)
     store_lane(
         root,
-        OPEN,
+        session,
         LaneFields(
             symbol=symbol,
             base_asset=base,
@@ -1030,6 +1031,187 @@ def _named_days(symbol: str, event: date, quotes: list[Decimal]) -> tuple[DailyB
             )
         )
     return tuple(bars)
+
+
+def test_liquidity_uses_earlier_books_without_changing_them(tmp_path: Path) -> None:
+    from cip.evaluation.capture_cycle import _acquire_liquidity, _spread_history
+    from cip.evaluation.eligibility import Lane
+    from cip.evaluation.features import _median
+    from cip.evaluation.liquidity_capture import build_liquidity
+    from cip.evaluation.prospect import store_universe
+
+    target = date(2026, 10, 9)
+    moment = datetime(2026, 10, 9, 19, tzinfo=UTC)
+    store_universe(tmp_path, target, universe_capture(target, _info(), moment, moment))
+    universe = tmp_path / "captures/session=2026-10-09/universe.json"
+    document = json.loads(universe.read_text())
+    document["symbols"] = ["PASSUSDT"]
+    universe.write_text(json.dumps(document))
+    _passer(
+        tmp_path,
+        "PASSUSDT",
+        "PASS",
+        Decimal("1000000000"),
+        Lane.NORMAL,
+        days=400,
+        session=target,
+    )
+    earlier = _shot(date(2026, 10, 7), "100", "101")
+    middle = _shot(date(2026, 10, 8), "100", "102")
+    current = _shot(target, "100", "100.1")
+    later = _shot(date(2026, 10, 10), "100", "103")
+    store_session_book(tmp_path, date(2026, 10, 7), "PASSUSDT", earlier)
+    store_session_book(tmp_path, date(2026, 10, 8), "PASSUSDT", middle)
+    store_session_book(tmp_path, date(2026, 10, 10), "PASSUSDT", later)
+    store_session_book(
+        tmp_path, date(2026, 10, 8), "OTHERUSDT", _shot(date(2026, 10, 8), "50", "51")
+    )
+    kept = (tmp_path / "captures/session=2026-10-08/book/symbol=PASSUSDT.json").read_bytes()
+    calls: list[tuple[str, str | None]] = []
+    retries: list[str] = []
+    _acquire_liquidity(
+        tmp_path,
+        target,
+        moment,
+        Source({(target, "book", "PASSUSDT"): current}),
+        calls,
+        retries,
+    )
+    stored = json.loads(
+        (tmp_path / "captures/session=2026-10-09/liquidity/symbol=PASSUSDT.json").read_text()
+    )
+    spreads = [earlier.spread_bps, middle.spread_bps, current.spread_bps]
+    assert stored["spread_snapshots"] == 3
+    assert [Decimal(value) for value in stored["spread_bps"]] == spreads
+    assert Decimal(stored["median_spread_bps"]) == _median(spreads)
+    assert (tmp_path / "captures/session=2026-10-08/book/symbol=PASSUSDT.json").read_bytes() == kept
+    current_book = (tmp_path / "captures/session=2026-10-09/book/symbol=PASSUSDT.json").read_bytes()
+    _acquire_liquidity(tmp_path, target, moment, Source({}), calls, retries)
+    assert (
+        tmp_path / "captures/session=2026-10-09/book/symbol=PASSUSDT.json"
+    ).read_bytes() == current_book
+    assert [spread for _day, spread in _spread_history(tmp_path, "PASSUSDT", target)] == spreads
+    mismatch = tmp_path / "captures/session=2026-10-09/book/symbol=MISMATCHUSDT.json"
+    mismatch.write_bytes(current_book)
+    rewritten = json.loads(mismatch.read_text())
+    rewritten["symbol"] = "MISMATCHUSDT"
+    rewritten["spread_bps"] = ["999"]
+    mismatch.write_text(json.dumps(rewritten))
+    document["symbols"] = ["PASSUSDT", "MISMATCHUSDT"]
+    universe.write_text(json.dumps(document))
+    _passer(
+        tmp_path,
+        "MISMATCHUSDT",
+        "MISMATCH",
+        Decimal("1000000000"),
+        Lane.NORMAL,
+        days=400,
+        session=target,
+    )
+    with pytest.raises(EvaluationError, match="does not match"):
+        _acquire_liquidity(tmp_path, target, moment, Source({}), calls, retries)
+    for blocked in ("2026-10-05", "2026-10-06"):
+        path = tmp_path / f"captures/session={blocked}/book/symbol=PASSUSDT.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(kept.decode())
+    assert [spread for _day, spread in _spread_history(tmp_path, "PASSUSDT", target)] == spreads
+    with pytest.raises(EvaluationError, match="unusable"):
+        build_liquidity(
+            "PASSUSDT",
+            session=target,
+            captured_at=moment,
+            spread_bps=Decimal("1"),
+            prior_spreads=(Decimal("-1"),),
+            bid_usd=Decimal("1"),
+            ask_usd=Decimal("1"),
+            book_observed_at=moment,
+        )
+
+
+def _shot(day: date, bid: str, ask: str) -> BookShot:
+    from cip.adapters.market import Depth, DepthLevel
+    from cip.evaluation.liquidity_capture import book_metrics
+
+    captured = datetime(day.year, day.month, day.day, 19, tzinfo=UTC)
+    bids = (DepthLevel(Decimal(bid), Decimal("1000")),)
+    asks = (DepthLevel(Decimal(ask), Decimal("1000")),)
+    reading = book_metrics(Depth(0, bids, asks), band=Decimal("0.02"), observed_at=captured)
+    assert reading is not None
+    return BookShot(
+        reading.spread_bps,
+        captured,
+        captured,
+        ((Decimal(bid), Decimal("1000")),),
+        ((Decimal(ask), Decimal("1000")),),
+    )
+
+
+def test_a_book_outside_its_session_is_not_spread_history(tmp_path: Path) -> None:
+    from cip.evaluation.capture_cycle import _spread_history
+
+    folder = tmp_path / "captures/session=2026-10-08/book"
+    folder.mkdir(parents=True)
+    path = folder / "symbol=BADUSDT.json"
+    path.write_text(
+        json.dumps(
+            {
+                "session": "2026-10-11",
+                "symbol": "BADUSDT",
+                "spread_bps": ["1"],
+                "captured_at": "2026-10-08T19:00:00Z",
+            }
+        )
+    )
+    with pytest.raises(EvaluationError, match="unusable"):
+        _spread_history(tmp_path, "BADUSDT", date(2026, 10, 9))
+    path.write_text(
+        json.dumps(
+            {
+                "session": "2026-10-08",
+                "symbol": "BADUSDT",
+                "spread_bps": ["1"],
+                "captured_at": "2026-10-09T00:00:01Z",
+            }
+        )
+    )
+    with pytest.raises(EvaluationError, match="after the close"):
+        _spread_history(tmp_path, "BADUSDT", date(2026, 10, 9))
+    path.write_text("{")
+    with pytest.raises(EvaluationError, match="unusable"):
+        _spread_history(tmp_path, "BADUSDT", date(2026, 10, 9))
+    path.write_text(
+        json.dumps(
+            {
+                "session": "2026-10-08",
+                "symbol": "BADUSDT",
+                "spread_bps": ["1", "2"],
+                "captured_at": "2026-10-08T19:00:00Z",
+            }
+        )
+    )
+    with pytest.raises(EvaluationError, match="unusable"):
+        _spread_history(tmp_path, "BADUSDT", date(2026, 10, 9))
+    path.write_text("[]")
+    with pytest.raises(EvaluationError, match="unusable"):
+        _spread_history(tmp_path, "BADUSDT", date(2026, 10, 9))
+    path.write_text(
+        json.dumps(
+            {
+                "session": "2026-10-08",
+                "symbol": "BADUSDT",
+                "spread_bps": ["1"],
+                "captured_at": "yesterday",
+            }
+        )
+    )
+    with pytest.raises(EvaluationError, match="unusable"):
+        _spread_history(tmp_path, "BADUSDT", date(2026, 10, 9))
+    odd = tmp_path / "captures/session=nope/book"
+    odd.mkdir(parents=True)
+    (odd / "symbol=ODDUSDT.json").write_text("{}")
+    with pytest.raises(EvaluationError, match="unusable"):
+        _spread_history(tmp_path, "ODDUSDT", date(2026, 10, 9))
+    assert _spread_history(tmp_path / "empty", "PASSUSDT", date(2026, 10, 9)) == ()
 
 
 def test_a_finalized_session_is_not_captured_again(tmp_path: Path) -> None:

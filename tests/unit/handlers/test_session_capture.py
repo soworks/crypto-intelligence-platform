@@ -962,6 +962,60 @@ def test_download_skips_a_sealed_key_and_rejects_a_non_byte_body(tmp_path: Path)
         session_capture._download(_Text(), BUCKET, root, NOW)
 
 
+def test_download_reads_earlier_books_and_skips_a_later_session(tmp_path: Path) -> None:
+    eth = "captures/session=2026-10-07/book/symbol=ETHUSDT.json"
+    btc = "captures/session=2026-10-07/book/symbol=BTCUSDT.json"
+
+    class _Books:
+        def __init__(self) -> None:
+            self.catalog = 0
+
+        def list_objects_v2(self, **kwargs: object) -> dict[str, object]:
+            prefix = str(kwargs.get("Prefix"))
+            if kwargs.get("Delimiter") == "/":
+                self.catalog += 1
+                if self.catalog == 1:
+                    return {
+                        "CommonPrefixes": [
+                            {"Prefix": "captures/session=2026-10-05/"},
+                            {"Prefix": "captures/session=nope/"},
+                            {"Prefix": "captures/session=2026-10-06/"},
+                        ],
+                        "IsTruncated": True,
+                        "NextContinuationToken": "more",
+                    }
+                return {
+                    "CommonPrefixes": [
+                        {"Prefix": "captures/session=2026-10-07/"},
+                        {"Prefix": "captures/session=2026-10-09/"},
+                        {"Prefix": "captures/not-a-session/"},
+                    ],
+                    "IsTruncated": False,
+                }
+            if prefix == "captures/session=2026-10-08/":
+                return {"Contents": [{"Key": "captures/session=2026-10-08/universe.json"}]}
+            if prefix == "captures/session=2026-10-07/":
+                return {"Contents": [{"Key": eth}]}
+            if prefix == "captures/session=2026-10-07/book/":
+                return {
+                    "Contents": [{"Key": eth}, {"Key": btc}, {"Key": "other/symbol=BTCUSDT.json"}]
+                }
+            return {"Contents": []}
+
+        def get_object(self, **kwargs: object) -> dict[str, object]:
+            return {"Body": BytesIO(str(kwargs["Key"]).encode())}
+
+    root = tmp_path / "books"
+    root.mkdir()
+    stored = session_capture._download(_Books(), BUCKET, root, AFTER)
+    assert stored[eth] == eth.encode()
+    assert stored[btc] == btc.encode()
+    assert list(stored).count(eth) == 1
+    assert "captures/session=2026-10-09/book/symbol=BTCUSDT.json" not in stored
+    assert "captures/session=2026-10-06/book/symbol=BTCUSDT.json" not in stored
+    assert not (root / "captures/session=2026-10-05").exists()
+
+
 def test_a_stray_file_is_not_uploaded_and_storage_root_has_a_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

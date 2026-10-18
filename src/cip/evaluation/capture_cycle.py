@@ -2,7 +2,7 @@
 
 The session comes from the clock. A scheduled payload cannot name a future
 session. A temporary provider failure is left unstored while a retry remains
-possible. One stored book is the session's only spread snapshot.
+possible. One stored book is that session's spread snapshot.
 """
 
 from __future__ import annotations
@@ -129,6 +129,46 @@ def book_is_stored(root: Path, session: date, symbol: str) -> bool:
     if isinstance(snapshots, int) and not isinstance(snapshots, bool) and snapshots >= 1:
         return True
     return isinstance(spreads, list) and len(spreads) >= 1
+
+
+def _spread_history(root: Path, symbol: str, session: date) -> tuple[tuple[date, Decimal], ...]:
+    """This symbol's stored books on or before the session, oldest first."""
+    found: list[tuple[date, Decimal]] = []
+    captures = root / "captures"
+    if not captures.is_dir():
+        return ()
+    for path in captures.glob(f"session=*/book/symbol={symbol}.json"):
+        folder = path.parents[1].name
+        try:
+            day = date.fromisoformat(folder.removeprefix("session="))
+        except ValueError as error:
+            raise EvaluationError("capture is unusable") from error
+        if day > session or day <= BLOCKED_THROUGH or day == _SEALED:
+            continue
+        found.append((day, _book_spread(path, day, symbol)))
+    found.sort(key=lambda item: item[0])
+    return tuple(found)
+
+
+def _book_spread(path: Path, session: date, symbol: str) -> Decimal:
+    try:
+        document = json.loads(path.read_text())
+    except json.JSONDecodeError as error:
+        raise EvaluationError("capture is unusable") from error
+    if not isinstance(document, dict):
+        raise EvaluationError("capture is unusable")
+    if document.get("session") != session.isoformat() or document.get("symbol") != symbol:
+        raise EvaluationError("capture is unusable")
+    try:
+        captured = _clock_of(document.get("captured_at"), "captured_at")
+    except ValueError as error:
+        raise EvaluationError("capture is unusable") from error
+    if captured > session_close(session):
+        raise EvaluationError("capture is after the close")
+    raw = document.get("spread_bps")
+    if not isinstance(raw, list) or len(raw) != 1:
+        raise EvaluationError("capture is unusable")
+    return _money(raw[0])
 
 
 def store_session_book(root: Path, session: date, symbol: str, book: BookShot) -> None:
@@ -308,7 +348,7 @@ def _acquire_liquidity(
     calls: list[tuple[str, str | None]],
     retries: list[str],
 ) -> None:
-    """One current book for each normal-lane passer. Older books are not copied."""
+    """One current book for each normal-lane passer. Older books stay where they were."""
     universe = load_universe()
     loaded_policy = load_policy(_policy_path())
     band = loaded_policy.policy.recorders.depth_band
@@ -357,6 +397,10 @@ def _store_passer_liquidity(
     )
     if reading is None:
         return
+    history = _spread_history(root, symbol, session)
+    current = next((spread for day, spread in history if day == session), None)
+    if current != reading.spread_bps:
+        raise EvaluationError("capture does not match the raw observations")
     quote, ticker_at = _ticker_quote(root, session, symbol)
     closes, peg_at = _peg_closes(root, session)
     aggregate = _aggregate_volume(root, session, item.coin_id, item.market_cap_source_timestamp)
@@ -368,6 +412,7 @@ def _store_passer_liquidity(
             session=session,
             captured_at=now,
             spread_bps=reading.spread_bps,
+            prior_spreads=tuple(spread for day, spread in history if day < session),
             bid_usd=reading.bid_usd,
             ask_usd=reading.ask_usd,
             book_observed_at=observed,

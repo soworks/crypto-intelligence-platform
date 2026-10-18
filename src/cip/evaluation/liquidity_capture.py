@@ -288,6 +288,7 @@ def build_liquidity(
     bid_usd: Decimal,
     ask_usd: Decimal,
     book_observed_at: datetime,
+    prior_spreads: tuple[Decimal, ...] = (),
     quote_volume: Decimal | None = None,
     ticker_captured_at: datetime | None = None,
     market_cap: Decimal | None = None,
@@ -297,7 +298,10 @@ def build_liquidity(
     peg_limit: Decimal | None = None,
     peg_captured_at: datetime | None = None,
 ) -> LiquidityCapture:
-    """One session book plus stored prints. Closed-bar fields stay missing."""
+    """One session book plus earlier books for that symbol. Closed-bar fields stay missing."""
+    spreads = (*prior_spreads, spread_bps)
+    if any(not value.is_finite() or value < 0 for value in spreads):
+        raise EvaluationError("capture is unusable")
     derived = derive_liquidity(
         (),
         session,
@@ -315,9 +319,9 @@ def build_liquidity(
         bars=(),
         median_quote_volume_30d_usd=derived.median_quote_volume_30d_usd,
         day_quote_volume_usd=derived.day_quote_volume_usd,
-        spread_bps=(spread_bps,),
-        median_spread_bps=_median([spread_bps]),
-        spread_snapshots=1,
+        spread_bps=spreads,
+        median_spread_bps=_median(list(spreads)),
+        spread_snapshots=len(spreads),
         bid_usd=bid_usd,
         ask_usd=ask_usd,
         depth_usd_per_side=min(bid_usd, ask_usd),
