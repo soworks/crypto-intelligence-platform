@@ -43,7 +43,7 @@ def scan_finalized_session(
         for symbol, candidate in recorded.candidates.items()
         if candidate is not None
     }
-    if _classification_stored(root, session):
+    if manifest.input_manifest_version == 2 and _classification_stored(root, session):
         candidates = {
             symbol: candidate
             for symbol, candidate in assemble_stored_candidates(

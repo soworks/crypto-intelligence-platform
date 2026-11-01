@@ -697,6 +697,27 @@ def test_stored_evidence_records_each_symbol_without_a_provider(
     assert sol.market.spread_snapshots == 6
 
 
+def test_a_version_one_session_keeps_the_sealed_packets(tmp_path: Path) -> None:
+    _stored_session(tmp_path)
+    path = tmp_path / f"sessions/date={_STORED.isoformat()}/manifest.json"
+    document = json.loads(path.read_text())
+    document["input_manifest_version"] = 1
+    for name in ("liquidity_inputs_sha256", "hour_grid_sha256", "book_inputs_sha256"):
+        document.pop(name, None)
+    body = json.dumps(document, sort_keys=True)
+    path.write_text(body)
+    liquidity = tmp_path / f"captures/session={_STORED.isoformat()}/liquidity/symbol={SOL}.json"
+    liquidity.unlink()
+    result = _scan(tmp_path, session=_STORED)
+    by_symbol = {record.symbol: record for record in result.records}
+    assert [record.symbol for record in result.records] == [_FDUSD, _USDE, SOL]
+    assert by_symbol[_FDUSD].reason_codes == ("missing_candidate",)
+    assert by_symbol[_USDE].reason_codes == ("missing_candidate",)
+    assert by_symbol[SOL].reason_codes == ("score_weights_not_frozen",)
+    assert path.read_text() == body
+    assert replay_session(tmp_path, _STORED).readiness.ready is True
+
+
 def test_an_open_book_without_a_liquidity_document_still_records_every_symbol(
     tmp_path: Path,
 ) -> None:
