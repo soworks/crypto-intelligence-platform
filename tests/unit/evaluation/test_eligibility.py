@@ -211,6 +211,21 @@ def test_high_risk_thresholds_fail_closed() -> None:
     )
 
 
+def test_a_classification_rejection_stops_before_lane_fields() -> None:
+    result = assess(
+        _normal(
+            withdrawals_suspended=True,
+            market_cap_rank=None,
+            circulating_ratio=None,
+            fdv_to_market_cap=None,
+            history_days=None,
+        ),
+        UNIVERSE,
+    )
+    assert result.lane is Lane.NORMAL
+    assert result.reason_codes == ("withdrawals_suspended",)
+
+
 def test_a_fan_token_with_no_market_cap_keeps_both_reasons() -> None:
     result = assess(_normal(fan_token=True, market_cap_usd=None), UNIVERSE)
     assert result.lane is None

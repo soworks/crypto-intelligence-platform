@@ -20,7 +20,7 @@ from cip.evaluation.decision import (
     SourceStamp,
     decision_id,
 )
-from cip.evaluation.eligibility import CandidateFacts
+from cip.evaluation.eligibility import CandidateFacts, _exclusions, assess
 from cip.evaluation.features import Tokenomics, measure
 from cip.evaluation.fundamentals import (
     CmcReading,
@@ -196,7 +196,10 @@ def _prepare(
     ).features
     if candidate is None:
         return _ineligible(symbol, ("missing_candidate",), features, regime, sources)
-    market = assess_market(candidate.facts, candidate.market, hypotheses.universe)
+    market = assess(candidate.facts, hypotheses.universe)
+    classification_closed = bool(_exclusions(candidate.facts, hypotheses.universe))
+    if not classification_closed and (market.eligible or _market_observed(candidate.market)):
+        market = assess_market(candidate.facts, candidate.market, hypotheses.universe)
     if not market.eligible:
         return _ineligible(symbol, market.reason_codes, features, regime, sources)
     fundamentals = assess_fundamentals(
@@ -226,6 +229,13 @@ def _prepare(
         regime.raw,
         sources,
     )
+
+
+def _market_observed(market: MarketSnapshot) -> bool:
+    """A clock alone is not a book. Null fields stay unobserved."""
+    observed = market.model_dump()
+    observed.pop("as_of")
+    return any(value is not None for value in observed.values())
 
 
 def _score(

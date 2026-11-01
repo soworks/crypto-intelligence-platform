@@ -13,6 +13,7 @@ from cip.evaluation.inputs import load_session
 from cip.evaluation.populate import SessionManifest, _load_bars, _load_regime, replay_session
 from cip.evaluation.scan import ScanResult, run_daily_scan
 from cip.evaluation.store import DecisionWriter
+from cip.evaluation.stored_candidates import assemble_stored_candidates
 
 
 def scan_finalized_session(
@@ -37,6 +38,23 @@ def scan_finalized_session(
         raise EvaluationError("frozen score weights are not stored")
     recorded = load_session(root, session)
     observations, _failures = _load_regime(root, session)
+    candidates = {
+        symbol: candidate
+        for symbol, candidate in recorded.candidates.items()
+        if candidate is not None
+    }
+    if _classification_stored(root, session):
+        candidates = {
+            symbol: candidate
+            for symbol, candidate in assemble_stored_candidates(
+                root,
+                session,
+                recorded.snapshot,
+                dict(recorded.candidates),
+                policy.policy.hypotheses.universe,
+            ).items()
+            if candidate is not None
+        }
     return run_daily_scan(
         session=session,
         as_of=manifest.finalized_at,
@@ -45,11 +63,7 @@ def scan_finalized_session(
         git_sha=git_sha,
         correlation_id=correlation_id,
         snapshot=recorded.snapshot,
-        candidates={
-            symbol: candidate
-            for symbol, candidate in recorded.candidates.items()
-            if candidate is not None
-        },
+        candidates=candidates,
         bars=_load_bars(root, session),
         observations=observations,
         prior=(),
@@ -58,6 +72,11 @@ def scan_finalized_session(
         writer=writer,
         lineage=(_freeze_stamp(manifest),),
     )
+
+
+def _classification_stored(root: Path, session: date) -> bool:
+    folder = root / "sessions" / f"date={session.isoformat()}" / "classification"
+    return folder.is_dir() and any(folder.glob("symbol=*.json"))
 
 
 def _freeze_stamp(manifest: SessionManifest) -> SourceStamp:
@@ -71,6 +90,9 @@ def _freeze_stamp(manifest: SessionManifest) -> SourceStamp:
             f"bars={manifest.bars_manifest_sha256}",
             f"candidates={manifest.candidate_manifest_sha256}",
             f"regime={manifest.regime_inputs_sha256}",
+            f"liquidity={manifest.liquidity_inputs_sha256 or 'uncovered'}",
+            f"hours={manifest.hour_grid_sha256 or 'uncovered'}",
+            f"books={manifest.book_inputs_sha256 or 'uncovered'}",
             f"score_weights={manifest.score_weights}",
         )
     )

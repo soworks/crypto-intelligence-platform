@@ -8,10 +8,13 @@ import pytest
 
 from cip.domain.errors import EvaluationError
 from cip.domain.policy import load_policy
+from cip.evaluation.classification import SymbolClassification, store_classification
 from cip.evaluation.decision import Cohort, Disposition
-from cip.evaluation.eligibility import CandidateFacts
+from cip.evaluation.eligibility import CandidateFacts, Lane
 from cip.evaluation.features import Tokenomics
 from cip.evaluation.fundamentals import CmcReading, CoinGeckoReading, UnlockReading
+from cip.evaluation.inputs import load_session
+from cip.evaluation.lane_fields import LaneFields, store_lane
 from cip.evaluation.liquidity import MarketSnapshot
 from cip.evaluation.populate import (
     BarCapture,
@@ -24,10 +27,18 @@ from cip.evaluation.populate import (
     populate_session,
     replay_session,
 )
-from cip.evaluation.scan import ScanCandidate
+from cip.evaluation.scan import ScanCandidate, UniverseSnapshot
 from cip.evaluation.session import SessionReadiness
 from cip.evaluation.session_scan import scan_finalized_session
 from cip.evaluation.store import FileDecisionWriter
+from cip.evaluation.stored_candidates import (
+    _known,
+    _taker,
+    assemble_stored_candidates,
+)
+from cip.evaluation.stored_candidates import (
+    _money as _stored_money,
+)
 from cip.history.bars import DailyBar
 from cip.recorders.observation import Observation
 
@@ -302,7 +313,13 @@ def test_a_finalized_session_records_one_decision_per_frozen_symbol(tmp_path: Pa
     manifest = replay_session(tmp_path, SESSION).manifest
     assert manifest is not None
     assert freeze.observed_at == manifest.finalized_at
-    assert manifest.input_manifest_version == 1
+    assert manifest.input_manifest_version == 2
+    assert manifest.liquidity_inputs_sha256 is not None
+    assert manifest.hour_grid_sha256 is not None
+    assert manifest.book_inputs_sha256 is not None
+    assert f"liquidity={manifest.liquidity_inputs_sha256}" in freeze.provenance
+    assert f"hours={manifest.hour_grid_sha256}" in freeze.provenance
+    assert f"books={manifest.book_inputs_sha256}" in freeze.provenance
     assert f"manifest={manifest.input_manifest_version}" in freeze.provenance
     assert f"finalized_at={manifest.finalized_at.isoformat()}" in freeze.provenance
     assert f"git_sha={FREEZE_SHA}" in freeze.provenance
@@ -326,6 +343,25 @@ def test_a_finalized_session_records_one_decision_per_frozen_symbol(tmp_path: Pa
     )
     assert eth_bars["bars"][-1]["open_date"] == "2026-10-04"
     assert all(created.created for created in result.stored)
+
+
+def test_a_version_one_freeze_cites_uncovered_capture_hashes(tmp_path: Path) -> None:
+    _freeze(tmp_path)
+    path = tmp_path / "sessions" / "date=2026-10-05" / "manifest.json"
+    document = json.loads(path.read_text())
+    document["input_manifest_version"] = 1
+    document.pop("liquidity_inputs_sha256", None)
+    document.pop("hour_grid_sha256", None)
+    document.pop("book_inputs_sha256", None)
+    body = json.dumps(document, sort_keys=True)
+    path.write_text(body)
+    result = _scan(tmp_path)
+    freeze = next(source for source in result.records[0].sources if source.name == "session_freeze")
+    assert "manifest=1" in freeze.provenance
+    assert "liquidity=uncovered" in freeze.provenance
+    assert "hours=uncovered" in freeze.provenance
+    assert "books=uncovered" in freeze.provenance
+    assert path.read_text() == body
 
 
 def test_replay_matches_the_first_decisions_and_leaves_the_freeze(tmp_path: Path) -> None:
@@ -427,3 +463,410 @@ def test_the_scan_does_not_call_a_provider(tmp_path: Path, monkeypatch: pytest.M
     assert "boto3" not in source
     result = _scan(tmp_path)
     assert len(result.records) == 2
+
+
+_STORED = date(2026, 10, 9)
+_STORED_CLOSE = datetime(2026, 10, 10, tzinfo=UTC)
+_WHEN = datetime(2026, 10, 9, 12, tzinfo=UTC)
+_FDUSD = "FDUSDUSDT"
+_USDE = "USDEUSDT"
+
+
+def _shifted_crash(end: date) -> tuple[DailyBar, ...]:
+    bars = list(_crashed_btc())
+    shift = end - bars[-1].open_date
+    return tuple(
+        DailyBar(
+            symbol=bar.symbol,
+            open_date=bar.open_date + shift,
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            volume=bar.volume,
+            quote_volume=bar.quote_volume,
+            trade_count=bar.trade_count,
+            taker_buy_base_volume=bar.taker_buy_base_volume,
+            taker_buy_quote_volume=bar.taker_buy_quote_volume,
+        )
+        for bar in bars
+    )
+
+
+def _normal_lane(symbol: str, base: str) -> LaneFields:
+    return LaneFields(
+        symbol=symbol,
+        base_asset=base,
+        lane=Lane.NORMAL,
+        coin_id=base.lower(),
+        circulating_ratio=None,
+        history_days=None,
+        history_open=None,
+        market_cap_rank=None,
+        fdv_to_market_cap=None,
+        unlock_state="unavailable",
+        market_source_timestamp=None,
+        market_captured_at=_WHEN,
+        history_captured_at=_WHEN,
+        unlock_provider=None,
+        unlock_provider_id=None,
+        unlock_source_timestamp=None,
+    )
+
+
+def _classified(symbol: str, base: str) -> SymbolClassification:
+    return SymbolClassification(
+        symbol=symbol,
+        base_asset=base,
+        eur_stable=False,
+        fan_token=False,
+        monitoring_tag=False,
+        delisting=False,
+        deposits_suspended=False,
+        withdrawals_suspended=False,
+        pending_migration=False,
+        coin_id=base.lower(),
+        mapping="unambiguous",
+        market_cap_usd=Decimal("1000000000"),
+        market_cap_source_timestamp=_WHEN,
+        cmc_id=None,
+        cmc_market_cap_usd=None,
+        cmc_source_timestamp=None,
+    )
+
+
+def _passing_packet(symbol: str, base: str, gecko: str) -> ScanCandidate:
+    packet = _eligible(symbol, base, gecko)
+    fresh = _WHEN
+    return packet.model_copy(
+        update={
+            "market": packet.market.model_copy(update={"as_of": _STORED_CLOSE}),
+            "coingecko": packet.coingecko.model_copy(update={"source_timestamp": fresh}),
+            "cmc": packet.cmc.model_copy(update={"source_timestamp": fresh}),
+        }
+    )
+
+
+def _liquidity(symbol: str, market: MarketSnapshot) -> None:
+    del symbol
+    return {
+        "spread_bps": ["1"],
+        "median_spread_bps": format(market.median_spread_bps, "f"),
+        "spread_snapshots": market.spread_snapshots,
+        "depth_usd_per_side": format(market.depth_usd_per_side, "f"),
+        "turnover": format(market.turnover, "f"),
+        "binance_volume_share": format(market.binance_volume_share, "f"),
+        "stablecoin_peg_deviation": format(market.stablecoin_peg_deviation, "f"),
+        "peg_deviation_hours": market.peg_deviation_hours,
+        "median_quote_volume_30d_usd": format(market.median_quote_volume_30d_usd, "f"),
+        "day_quote_volume_usd": format(market.day_quote_volume_usd, "f"),
+        "volume_zscore": format(market.volume_zscore, "f"),
+        "price_move": format(market.price_move, "f"),
+        "trade_size_stdev": format(market.trade_size_stdev, "f"),
+        "binance_quote_volume_24h": None,
+        "market_cap_usd": None,
+        "aggregate_volume_usd": None,
+    }
+
+
+def _write_json(path: Path, document: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, sort_keys=True))
+
+
+def _stored_session(
+    tmp_path: Path, *, sol_liquidity: bool = True, sol_book: bool = False
+) -> ScanCandidate:
+    sol = _passing_packet(SOL, "SOL", "solana")
+    if sol_book and not sol_liquidity:
+        sol = sol.model_copy(
+            update={
+                "market": sol.market.model_copy(
+                    update={
+                        "median_spread_bps": None,
+                        "spread_snapshots": None,
+                        "depth_usd_per_side": None,
+                    }
+                )
+            }
+        )
+    for symbol, base in ((_FDUSD, "FDUSD"), (_USDE, "USDE"), (SOL, "SOL")):
+        store_classification(tmp_path, _STORED, _classified(symbol, base), _WHEN)
+    store_lane(tmp_path, _STORED, _normal_lane(_FDUSD, "FDUSD"))
+    if sol_book:
+        _write_json(
+            tmp_path / f"captures/session={_STORED.isoformat()}/book/symbol={SOL}.json",
+            {"spread_bps": ["1"], "spread_snapshots": 1},
+        )
+    if sol_liquidity:
+        _write_json(
+            tmp_path / f"captures/session={_STORED.isoformat()}/liquidity/symbol={SOL}.json",
+            _liquidity(SOL, sol.market),
+        )
+    _write_json(
+        tmp_path / f"captures/session={_STORED.isoformat()}/hours/symbol={SOL}.json",
+        {"spike_candle_count": sol.market.spike_candle_count},
+    )
+    _write_json(
+        tmp_path / f"captures/session={_STORED.isoformat()}/liquidity/symbol={_USDE}.json",
+        {"depth_usd_per_side": "0", "spread_snapshots": 1, "spread_bps": ["1"]},
+    )
+    captures = SessionCaptures(
+        universe=UniverseCapture(
+            (_FDUSD, _USDE, SOL), _WHEN, CaptureClock("binance/exchangeInfo", _WHEN, _WHEN)
+        ),
+        packets=(PacketCapture(SOL, sol, CaptureClock("binance/ticker", _WHEN, _WHEN)),),
+        candidate_absences=(),
+        bars=(
+            BarCapture(
+                BTC,
+                _shifted_crash(_STORED),
+                CaptureClock("binance/klines", _STORED_CLOSE, _STORED_CLOSE),
+            ),
+            BarCapture(
+                SOL,
+                _flat(SOL, 60, end=_STORED),
+                CaptureClock("binance/klines", _STORED_CLOSE, _STORED_CLOSE),
+            ),
+        ),
+        bar_absences=(),
+        regime=(
+            RegimeCapture(
+                Observation(
+                    series="btc_dominance",
+                    provider="coingecko",
+                    source_timestamp=_WHEN,
+                    observed_at=_WHEN,
+                    symbol=None,
+                    values=(("btc_dominance", Decimal("1")),),
+                    units=(("btc_dominance", "percent"),),
+                ),
+                _WHEN,
+            ),
+            RegimeCapture(
+                Observation(
+                    series="stablecoin_supply",
+                    provider="defillama",
+                    source_timestamp=_WHEN,
+                    observed_at=_WHEN,
+                    symbol=None,
+                    values=(("stablecoin_supply_usd", Decimal("1")),),
+                    units=(("stablecoin_supply_usd", "usd"),),
+                ),
+                _WHEN,
+            ),
+        ),
+        regime_failures=(),
+    )
+    result = populate_session(
+        tmp_path,
+        _STORED,
+        _STORED_CLOSE,
+        captures,
+        git_sha=FREEZE_SHA,
+        weights_present=False,
+    )
+    assert result.manifest is not None
+    return sol
+
+
+def test_stored_evidence_records_each_symbol_without_a_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sol = _stored_session(tmp_path)
+
+    def refused(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("provider call")
+
+    monkeypatch.setattr(socket, "create_connection", refused)
+    first = _scan(tmp_path, session=_STORED)
+    second = _scan(tmp_path, session=_STORED)
+    assert [record.symbol for record in first.records] == [_FDUSD, _USDE, SOL]
+    by_symbol = {record.symbol: record for record in first.records}
+    assert by_symbol[_FDUSD].reason_codes == ("stablecoin",)
+    assert by_symbol[_USDE].reason_codes == ("stablecoin",)
+    assert "missing_market_cap_rank" not in by_symbol[_FDUSD].reason_codes
+    assert "missing_circulating_supply" not in by_symbol[_USDE].reason_codes
+    assert "depth_below_minimum" not in by_symbol[_USDE].reason_codes
+    assert by_symbol[SOL].reason_codes == ("score_weights_not_frozen",)
+    assert by_symbol[SOL].disposition is Disposition.INELIGIBLE
+    assert [record.to_document() for record in second.records] == [
+        record.to_document() for record in first.records
+    ]
+    assert all(item.created is False for item in second.stored)
+    assert sol.market.spread_snapshots == 6
+
+
+def test_an_open_book_without_a_liquidity_document_still_records_every_symbol(
+    tmp_path: Path,
+) -> None:
+    _stored_session(tmp_path, sol_liquidity=False, sol_book=True)
+    result = _scan(tmp_path, session=_STORED)
+    assert [record.symbol for record in result.records] == [_FDUSD, _USDE, SOL]
+    sol = next(record for record in result.records if record.symbol == SOL)
+    assert sol.disposition is Disposition.INELIGIBLE
+    assert "missing_median_spread" not in sol.reason_codes
+    assert "missing_depth" in sol.reason_codes
+    book = tmp_path / f"captures/session={_STORED.isoformat()}/book/symbol={SOL}.json"
+    sealed = (tmp_path / f"sessions/date={_STORED.isoformat()}/manifest.json").read_bytes()
+    book.write_text('{"spread_bps": ["2"], "spread_snapshots": 1}')
+    with pytest.raises(EvaluationError, match="does not match its inputs"):
+        _scan(tmp_path, session=_STORED)
+    assert (tmp_path / f"sessions/date={_STORED.isoformat()}/manifest.json").read_bytes() == sealed
+
+
+def test_an_open_symbol_without_stored_liquidity_fails_explicitly(tmp_path: Path) -> None:
+    _stored_session(tmp_path, sol_liquidity=False)
+    with pytest.raises(EvaluationError, match="book evidence is missing"):
+        _scan(tmp_path, session=_STORED)
+    assert list((tmp_path / "decisions").rglob("*.json")) == []
+
+
+def test_a_changed_sealed_liquidity_file_is_rejected(tmp_path: Path) -> None:
+    _stored_session(tmp_path)
+    path = tmp_path / f"captures/session={_STORED.isoformat()}/liquidity/symbol={SOL}.json"
+    sealed = (tmp_path / f"sessions/date={_STORED.isoformat()}/manifest.json").read_bytes()
+    path.unlink()
+    with pytest.raises(EvaluationError, match="does not match its inputs"):
+        _scan(tmp_path, session=_STORED)
+    assert (tmp_path / f"sessions/date={_STORED.isoformat()}/manifest.json").read_bytes() == sealed
+    assert list((tmp_path / "decisions").rglob("*.json")) == []
+
+
+def test_stored_evidence_rejects_a_gap_without_inventing_a_value(tmp_path: Path) -> None:
+    _stored_session(tmp_path)
+    universe = _POLICY.policy.hypotheses.universe
+    snapshot = UniverseSnapshot(
+        session=_STORED,
+        symbols=("NOPEUSDT",),
+        observed_at=_WHEN,
+        provenance="binance/exchangeInfo",
+    )
+    with pytest.raises(EvaluationError, match="universe snapshot is missing"):
+        assemble_stored_candidates(tmp_path, _STORED, None, {}, universe)
+    with pytest.raises(EvaluationError, match="classification is missing"):
+        assemble_stored_candidates(tmp_path, _STORED, snapshot, {}, universe)
+    recorded = {
+        _FDUSD: None,
+        _USDE: None,
+        SOL: None,
+    }
+    with pytest.raises(EvaluationError, match="candidate evidence is missing"):
+        assemble_stored_candidates(
+            tmp_path,
+            _STORED,
+            UniverseSnapshot(
+                session=_STORED,
+                symbols=(_FDUSD, SOL),
+                observed_at=_WHEN,
+                provenance="binance/exchangeInfo",
+            ),
+            recorded,
+            universe,
+        )
+    recorded = load_session(tmp_path, _STORED)
+    hours = tmp_path / f"captures/session={_STORED.isoformat()}/hours/symbol={SOL}.json"
+    hours.unlink()
+    with pytest.raises(EvaluationError, match="hour grid is missing"):
+        assemble_stored_candidates(
+            tmp_path, _STORED, recorded.snapshot, dict(recorded.candidates), universe
+        )
+    _write_json(hours, {"spike_candle_count": "no"})
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        assemble_stored_candidates(
+            tmp_path, _STORED, recorded.snapshot, dict(recorded.candidates), universe
+        )
+    hours.write_text("{")
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        assemble_stored_candidates(
+            tmp_path, _STORED, recorded.snapshot, dict(recorded.candidates), universe
+        )
+    _write_json(hours, {"spike_candle_count": 3})
+    liquidity = tmp_path / f"captures/session={_STORED.isoformat()}/liquidity/symbol={SOL}.json"
+    liquidity.write_text("[]")
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        assemble_stored_candidates(
+            tmp_path, _STORED, recorded.snapshot, dict(recorded.candidates), universe
+        )
+    _write_json(liquidity, {"spread_snapshots": -1})
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        assemble_stored_candidates(
+            tmp_path, _STORED, recorded.snapshot, dict(recorded.candidates), universe
+        )
+    liquidity.unlink()
+    book = tmp_path / f"captures/session={_STORED.isoformat()}/book/symbol={SOL}.json"
+    _write_json(book, {"spread_bps": "1", "spread_snapshots": 1})
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        assemble_stored_candidates(
+            tmp_path, _STORED, recorded.snapshot, dict(recorded.candidates), universe
+        )
+    _write_json(book, {"spread_bps": ["1", "2"], "spread_snapshots": 2})
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        assemble_stored_candidates(
+            tmp_path, _STORED, recorded.snapshot, dict(recorded.candidates), universe
+        )
+    _write_json(book, {"spread_bps": ["1"], "spread_snapshots": "1"})
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        assemble_stored_candidates(
+            tmp_path, _STORED, recorded.snapshot, dict(recorded.candidates), universe
+        )
+    book.write_text("[]")
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        assemble_stored_candidates(
+            tmp_path, _STORED, recorded.snapshot, dict(recorded.candidates), universe
+        )
+    book.unlink()
+    with pytest.raises(EvaluationError, match="book evidence is missing"):
+        assemble_stored_candidates(
+            tmp_path, _STORED, recorded.snapshot, dict(recorded.candidates), universe
+        )
+    bars = tmp_path / f"sessions/date={_STORED.isoformat()}/bars/symbol={SOL}.json"
+    bars.unlink()
+    _write_json(liquidity, {"median_spread_bps": "1"})
+    with pytest.raises(EvaluationError, match="completed bars are missing"):
+        assemble_stored_candidates(
+            tmp_path, _STORED, recorded.snapshot, dict(recorded.candidates), universe
+        )
+    assert _known("unavailable") is None
+    assert _known("future_unlocks") is True
+    assert _known("no_applicable_future_unlock") is True
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        _known("later")
+    assert _stored_money(None) is None
+    assert _stored_money(Decimal("1")) == Decimal("1")
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        _stored_money(1)
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        _stored_money("nope")
+    with pytest.raises(EvaluationError, match="capture is unusable"):
+        _stored_money(Decimal("NaN"))
+    assert _taker((), _STORED) is None
+    zero = _bar(SOL, _STORED, "1")
+    zero = DailyBar(
+        symbol=SOL,
+        open_date=_STORED,
+        open=Decimal("1"),
+        high=Decimal("1"),
+        low=Decimal("1"),
+        close=Decimal("1"),
+        volume=Decimal("1"),
+        quote_volume=Decimal("0"),
+        trade_count=1,
+        taker_buy_base_volume=Decimal("0"),
+        taker_buy_quote_volume=Decimal("0"),
+    )
+    assert _taker((zero,), _STORED) is None
+    wide = DailyBar(
+        symbol=SOL,
+        open_date=_STORED,
+        open=Decimal("1"),
+        high=Decimal("1"),
+        low=Decimal("1"),
+        close=Decimal("1"),
+        volume=Decimal("1"),
+        quote_volume=Decimal("1"),
+        trade_count=1,
+        taker_buy_base_volume=Decimal("2"),
+        taker_buy_quote_volume=Decimal("2"),
+    )
+    assert _taker((wide,), _STORED) is None

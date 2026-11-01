@@ -145,6 +145,10 @@ def assess(facts: CandidateFacts, universe: UniverseHypotheses) -> EligibilityDe
         return _decision(False, None, ("base_asset_mismatch",))
     reasons = _exclusions(facts, universe)
     lane, lane_reasons = _lane(facts, universe)
+    if reasons:
+        if lane is None:
+            reasons.extend(lane_reasons)
+        return _decision(False, lane, tuple(reasons))
     reasons.extend(lane_reasons)
     if reasons:
         return _decision(False, lane, tuple(reasons))
