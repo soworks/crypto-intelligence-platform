@@ -16,9 +16,9 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self, cast
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from cip.domain.errors import EvaluationError
 from cip.evaluation.inputs import (
@@ -149,14 +149,32 @@ class SessionManifest(_Strict):
     session_date: date
     session_close_at: datetime
     finalized_at: datetime
-    input_manifest_version: Literal[1]
+    input_manifest_version: Literal[1, 2]
     universe_snapshot_sha256: str
     bars_manifest_sha256: str
     candidate_manifest_sha256: str
     regime_inputs_sha256: str
+    liquidity_inputs_sha256: str | None = None
+    hour_grid_sha256: str | None = None
+    book_inputs_sha256: str | None = None
     provenance: tuple[ProvenanceEntry, ...]
     git_sha: str
     score_weights: Literal["absent", "present"]
+
+    @model_validator(mode="after")
+    def _hash_coverage(self) -> Self:
+        present = (
+            self.liquidity_inputs_sha256 is not None,
+            self.hour_grid_sha256 is not None,
+            self.book_inputs_sha256 is not None,
+        )
+        if self.input_manifest_version == 2:
+            if present != (True, True, True):
+                raise ValueError("version 2 names every stored input")
+            return self
+        if present != (False, False, False):
+            raise ValueError("version 1 does not carry capture hashes")
+        return self
 
 
 @dataclass(frozen=True)
@@ -216,7 +234,8 @@ def replay_session(root: Path, session: date) -> PopulationResult:
     if not path.is_file():
         raise EvaluationError("session is not finalized")
     manifest = _read_manifest(path)
-    if manifest.session_date != session or _hashes(root, session) != _hash_record(manifest):
+    recorded = _hashes(root, session, version=manifest.input_manifest_version)
+    if manifest.session_date != session or recorded != _hash_record(manifest):
         raise EvaluationError("finalized session does not match its inputs")
     weights_present = manifest.score_weights == "present"
     readiness = _assess_stored(root, session, manifest.finalized_at, weights_present)
@@ -304,7 +323,15 @@ def _kept(
     """Return the first freeze, or refuse before any new file is created."""
     existing = _read_manifest(path)
     _attach_stage(root, session, plan)
-    built = _planned_manifest(session, as_of, git_sha, weights_present, plan)
+    built = _planned_manifest(
+        root,
+        session,
+        as_of,
+        git_sha,
+        weights_present,
+        plan,
+        version=existing.input_manifest_version,
+    )
     if not _same_freeze(existing, built):
         raise EvaluationError("finalized session already exists with a different payload")
     readiness = _assess(
@@ -333,8 +360,8 @@ def _seal(
     weights_present: bool,
     provenance: tuple[ProvenanceEntry, ...],
 ) -> SessionManifest:
-    hashes = _hashes(root, session)
-    built = _manifest_of(session, as_of, git_sha, weights_present, provenance, hashes)
+    hashes = _hashes(root, session, version=2)
+    built = _manifest_of(session, as_of, git_sha, weights_present, provenance, hashes, version=2)
     path = root / _manifest_path(session)
     if path.is_file():
         existing = _read_manifest(path)
@@ -346,14 +373,23 @@ def _seal(
 
 
 def _planned_manifest(
+    root: Path,
     session: date,
     as_of: datetime,
     git_sha: str,
     weights_present: bool,
     plan: _Plan,
+    *,
+    version: Literal[1, 2],
 ) -> SessionManifest:
     return _manifest_of(
-        session, as_of, git_sha, weights_present, plan.provenance, _planned_hashes(plan)
+        session,
+        as_of,
+        git_sha,
+        weights_present,
+        plan.provenance,
+        _planned_hashes(root, session, plan, version=version),
+        version=version,
     )
 
 
@@ -363,18 +399,26 @@ def _manifest_of(
     git_sha: str,
     weights_present: bool,
     provenance: tuple[ProvenanceEntry, ...],
-    hashes: tuple[str, str, str, str],
+    hashes: tuple[str, ...],
+    *,
+    version: Literal[1, 2],
 ) -> SessionManifest:
-    universe, bars, candidates, regime = hashes
+    universe, bars, candidates, regime = hashes[:4]
+    liquidity = hours = books = None
+    if version == 2:
+        liquidity, hours, books = hashes[4], hashes[5], hashes[6]
     return SessionManifest(
         session_date=session,
         session_close_at=session_close(session),
         finalized_at=as_of,
-        input_manifest_version=1,
+        input_manifest_version=version,
         universe_snapshot_sha256=universe,
         bars_manifest_sha256=bars,
         candidate_manifest_sha256=candidates,
         regime_inputs_sha256=regime,
+        liquidity_inputs_sha256=liquidity,
+        hour_grid_sha256=hours,
+        book_inputs_sha256=books,
         provenance=provenance,
         git_sha=git_sha,
         score_weights="present" if weights_present else "absent",
@@ -796,7 +840,9 @@ def _load_observation(document: Mapping[str, object]) -> Observation:
         raise EvaluationError("session input is unusable") from error
 
 
-def _planned_hashes(plan: _Plan) -> tuple[str, str, str, str]:
+def _planned_hashes(
+    root: Path, session: date, plan: _Plan, *, version: Literal[1, 2]
+) -> tuple[str, ...]:
     universe = _sha(b"" if plan.snapshot is None else _body(plan.snapshot))
     bars: list[tuple[str, bytes]] = []
     candidates: list[tuple[str, bytes]] = []
@@ -816,10 +862,12 @@ def _planned_hashes(plan: _Plan) -> tuple[str, str, str, str]:
     for symbol, candidate in plan.candidates.items():
         if candidate is not None:
             candidates.append((f"candidates/symbol={symbol}.json", _body(candidate)))
-    return (universe, _bundle(bars), _bundle(candidates), _bundle(regime))
+    return _with_captures(
+        root, session, (universe, _bundle(bars), _bundle(candidates), _bundle(regime)), version
+    )
 
 
-def _hashes(root: Path, session: date) -> tuple[str, str, str, str]:
+def _hashes(root: Path, session: date, *, version: Literal[1, 2]) -> tuple[str, ...]:
     universe = root / _universe_path(session)
     if not universe.is_file():
         raise EvaluationError("finalized session does not match its inputs")
@@ -830,15 +878,38 @@ def _hashes(root: Path, session: date) -> tuple[str, str, str, str]:
     candidates.extend(_named(root / _stage_dir(session, "classification"), "classification"))
     candidates.extend(_named(root / _stage_dir(session, "lane"), "lane"))
     regime = _named(root / _regime_path(session, "btc_dominance").parent, "regime")
-    return (_sha(universe.read_bytes()), _bundle(bars), _bundle(candidates), _bundle(regime))
+    base = (_sha(universe.read_bytes()), _bundle(bars), _bundle(candidates), _bundle(regime))
+    return _with_captures(root, session, base, version)
 
 
-def _hash_record(manifest: SessionManifest) -> tuple[str, str, str, str]:
+def _with_captures(
+    root: Path, session: date, base: tuple[str, str, str, str], version: Literal[1, 2]
+) -> tuple[str, ...]:
+    if version == 1:
+        return base
+    folder = root / "captures" / f"session={session.isoformat()}"
     return (
+        *base,
+        _bundle(_named(folder / "liquidity", "liquidity")),
+        _bundle(_named(folder / "hours", "hours")),
+        _bundle(_named(folder / "book", "book")),
+    )
+
+
+def _hash_record(manifest: SessionManifest) -> tuple[str, ...]:
+    recorded = (
         manifest.universe_snapshot_sha256,
         manifest.bars_manifest_sha256,
         manifest.candidate_manifest_sha256,
         manifest.regime_inputs_sha256,
+    )
+    if manifest.input_manifest_version == 1:
+        return recorded
+    return (
+        *recorded,
+        cast(str, manifest.liquidity_inputs_sha256),
+        cast(str, manifest.hour_grid_sha256),
+        cast(str, manifest.book_inputs_sha256),
     )
 
 

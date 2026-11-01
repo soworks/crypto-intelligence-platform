@@ -231,7 +231,10 @@ def test_a_closed_capture_becomes_ready_and_names_the_frozen_inputs(tmp_path: Pa
     assert manifest.session_date == SESSION
     assert manifest.session_close_at == CLOSE
     assert manifest.finalized_at == CLOSE
-    assert manifest.input_manifest_version == 1
+    assert manifest.input_manifest_version == 2
+    assert manifest.liquidity_inputs_sha256 is not None
+    assert manifest.hour_grid_sha256 is not None
+    assert manifest.book_inputs_sha256 is not None
     assert manifest.git_sha == SHA
     assert manifest.score_weights == "absent"
     assert len(manifest.universe_snapshot_sha256) == 64
@@ -246,6 +249,75 @@ def test_a_closed_capture_becomes_ready_and_names_the_frozen_inputs(tmp_path: Pa
     replay = replay_session(tmp_path, SESSION)
     assert replay.readiness.ready is True
     assert replay.manifest == manifest
+
+
+def test_a_new_seal_hashes_liquidity_and_the_hour_grid(tmp_path: Path) -> None:
+    folder = tmp_path / "captures" / "session=2026-10-05"
+    liquidity = folder / "liquidity" / "symbol=SOLUSDT.json"
+    hours = folder / "hours" / "symbol=SOLUSDT.json"
+    liquidity.parent.mkdir(parents=True)
+    hours.parent.mkdir(parents=True)
+    liquidity.write_text('{"depth_usd_per_side":"1"}')
+    hours.write_text('{"spike_candle_count":0}')
+    result = _populate(tmp_path, _ready(days=1))
+    manifest = result.manifest
+    assert manifest is not None
+    assert manifest.input_manifest_version == 2
+    assert manifest.liquidity_inputs_sha256 is not None
+    assert manifest.hour_grid_sha256 is not None
+    assert manifest.book_inputs_sha256 is not None
+    assert len(manifest.liquidity_inputs_sha256) == 64
+    assert len(manifest.hour_grid_sha256) == 64
+    assert len(manifest.book_inputs_sha256) == 64
+    sealed = _manifest(tmp_path).read_bytes()
+    liquidity.write_text('{"depth_usd_per_side":"2"}')
+    with pytest.raises(EvaluationError, match="does not match its inputs"):
+        replay_session(tmp_path, SESSION)
+    liquidity.write_text('{"depth_usd_per_side":"1"}')
+    hours.unlink()
+    with pytest.raises(EvaluationError, match="does not match its inputs"):
+        replay_session(tmp_path, SESSION)
+    assert _manifest(tmp_path).read_bytes() == sealed
+
+
+def test_a_version_one_manifest_is_replayed_and_not_rewritten(tmp_path: Path) -> None:
+    _populate(tmp_path, _ready(days=1))
+    document = json.loads(_manifest(tmp_path).read_text())
+    document["input_manifest_version"] = 1
+    document.pop("liquidity_inputs_sha256", None)
+    document.pop("hour_grid_sha256", None)
+    document.pop("book_inputs_sha256", None)
+    body = json.dumps(document, sort_keys=True).encode()
+    _manifest(tmp_path).write_bytes(body)
+    replayed = replay_session(tmp_path, SESSION)
+    assert replayed.manifest is not None
+    assert replayed.manifest.input_manifest_version == 1
+    assert replayed.manifest.liquidity_inputs_sha256 is None
+    assert replayed.manifest.hour_grid_sha256 is None
+    assert replayed.manifest.book_inputs_sha256 is None
+    assert _manifest(tmp_path).read_bytes() == body
+    again = _populate(tmp_path, _ready(days=1))
+    assert again.manifest == replayed.manifest
+    assert _manifest(tmp_path).read_bytes() == body
+    added = tmp_path / "captures" / "session=2026-10-05" / "liquidity" / "symbol=SOLUSDT.json"
+    added.parent.mkdir(parents=True)
+    added.write_text("{}")
+    assert replay_session(tmp_path, SESSION).readiness.ready is True
+    assert _manifest(tmp_path).read_bytes() == body
+
+
+def test_a_manifest_version_must_match_its_hash_coverage(tmp_path: Path) -> None:
+    _populate(tmp_path, _ready(days=1))
+    document = json.loads(_manifest(tmp_path).read_text())
+    document["input_manifest_version"] = 1
+    _manifest(tmp_path).write_text(json.dumps(document, sort_keys=True))
+    with pytest.raises(EvaluationError, match="session input is unusable"):
+        replay_session(tmp_path, SESSION)
+    document["input_manifest_version"] = 2
+    document.pop("hour_grid_sha256")
+    _manifest(tmp_path).write_text(json.dumps(document, sort_keys=True))
+    with pytest.raises(EvaluationError, match="session input is unusable"):
+        replay_session(tmp_path, SESSION)
 
 
 def test_the_close_instant_is_accepted_and_a_later_instant_is_rejected(tmp_path: Path) -> None:

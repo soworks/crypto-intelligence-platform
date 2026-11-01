@@ -201,6 +201,28 @@ def _scan(tmp_path: Path, **overrides: object) -> object:
     return run_daily_scan(**values)  # type: ignore[arg-type]
 
 
+def test_a_lane_rejection_reads_an_observed_book_and_ignores_a_blank_one(tmp_path: Path) -> None:
+    blank = _market().model_copy(
+        update={name: None for name in MarketSnapshot.model_fields if name != "as_of"}
+    )
+    thin = _market().model_copy(update={"depth_usd_per_side": Decimal("0")})
+    result = _scan(
+        tmp_path,
+        snapshot=_snapshot("SOLUSDT", "ETHUSDT"),
+        candidates={
+            "SOLUSDT": _candidate("SOLUSDT", "SOL", "solana", market_cap_rank=None).model_copy(
+                update={"market": blank}
+            ),
+            "ETHUSDT": _candidate("ETHUSDT", "ETH", "ethereum", market_cap_rank=None).model_copy(
+                update={"market": thin}
+            ),
+        },
+    )
+    by_symbol = {record.symbol: record for record in result.records}
+    assert by_symbol["SOLUSDT"].reason_codes == ("missing_market_cap_rank",)
+    assert by_symbol["ETHUSDT"].reason_codes == ("missing_market_cap_rank", "depth_below_minimum")
+
+
 def test_a_session_before_the_utc_close_records_nothing(tmp_path: Path) -> None:
     with pytest.raises(EvaluationError, match="has not closed"):
         _scan(tmp_path, as_of=CLOSE - timedelta(seconds=1))
